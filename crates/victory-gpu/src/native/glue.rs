@@ -1360,6 +1360,9 @@ pub(crate) fn log_draw_counts(frame: u64) {
     if typed_views > 0 {
         tracing::info!(frame, typed_views, typed_views_live, "native typed buffer views");
     }
+    if env_set!("VICTORY_TRACE_TEXTURE_MEMORY") {
+        with_title(|t| t.log_texture_memory(frame));
+    }
     super::descriptor_trace::log(frame);
 }
 

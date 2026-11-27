@@ -21,7 +21,7 @@
 use super::descriptors::format;
 use super::host::NativeHost;
 use super::title::Title;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use victory_backend::resources::*;
 use victory_formats::texture::{Dimension, Layout};
@@ -761,6 +761,209 @@ pub fn placed_key(address: u64, description: &[u32; 14]) -> usize {
     (u64::from_le_bytes(b.as_bytes()[..8].try_into().expect("8 bytes")) | 1 << 63) as usize
 }
 
+/// Start-indexed ranges plus disjoint coverage at each endpoint. A query reads
+/// coverage at its left endpoint and starts inside it: O(log n + hits), even
+/// when allowed pairs include a large texture containing many smaller ones.
+#[derive(Default)]
+struct PlacedRanges {
+    spans: BTreeMap<u64, (u64, HashSet<usize>)>,
+    starts: BTreeMap<u64, HashSet<usize>>,
+    bounds: HashMap<usize, (u64, u64)>,
+}
+
+impl PlacedRanges {
+    fn split(&mut self, at: u64) {
+        let Some((&start, (end, keys))) = self.spans.range(..=at).next_back() else {
+            return;
+        };
+        if start == at || *end <= at {
+            return;
+        }
+        let tail = (*end, keys.clone());
+        self.spans.get_mut(&start).unwrap().0 = at;
+        self.spans.insert(at, tail);
+    }
+
+    fn insert(&mut self, key: usize, start: u64, size: usize) {
+        let end = start.saturating_add(size as u64);
+        if self.bounds.get(&key) == Some(&(start, end)) {
+            return;
+        }
+        self.remove(key);
+        if end <= start {
+            return;
+        }
+        self.split(start);
+        self.split(end);
+        let starts: Vec<_> = self.spans.range(start..end).map(|(&s, _)| s).collect();
+        let mut cursor = start;
+        for s in starts {
+            if cursor < s {
+                self.spans.insert(cursor, (s, HashSet::from([key])));
+            }
+            let (e, keys) = self.spans.get_mut(&s).unwrap();
+            keys.insert(key);
+            cursor = *e;
+        }
+        if cursor < end {
+            self.spans.insert(cursor, (end, HashSet::from([key])));
+        }
+        self.bounds.insert(key, (start, end));
+        self.starts.entry(start).or_default().insert(key);
+        self.coalesce(start, end);
+    }
+
+    fn coalesce(&mut self, start: u64, end: u64) {
+        let first = self
+            .spans
+            .range(..start)
+            .next_back()
+            .map_or(start, |(&s, _)| s);
+        let starts: Vec<_> = self.spans.range(first..=end).map(|(&s, _)| s).collect();
+        let mut previous = None;
+        for s in starts {
+            if let Some(p) = previous
+                && self.spans[&p].0 == s
+                && self.spans[&p].1 == self.spans[&s].1
+            {
+                let (e, _) = self.spans.remove(&s).unwrap();
+                self.spans.get_mut(&p).unwrap().0 = e;
+            } else {
+                previous = Some(s);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: usize) {
+        let Some((start, end)) = self.bounds.remove(&key) else {
+            return;
+        };
+        if let Some(keys) = self.starts.get_mut(&start) {
+            keys.remove(&key);
+            if keys.is_empty() {
+                self.starts.remove(&start);
+            }
+        }
+        let empty: Vec<_> = self
+            .spans
+            .range_mut(start..end)
+            .filter_map(|(&s, (_, keys))| {
+                keys.remove(&key);
+                keys.is_empty().then_some(s)
+            })
+            .collect();
+        for s in empty {
+            self.spans.remove(&s);
+        }
+        self.coalesce(start, end);
+    }
+
+    fn overlapping(&self, start: u64, size: usize) -> HashSet<usize> {
+        let end = start.saturating_add(size as u64);
+        if end <= start {
+            return HashSet::new();
+        }
+        // Covering the left endpoint plus starts strictly inside the query:
+        // every hit appears once, even with deeply nested allowed ranges.
+        let mut hits = self
+            .spans
+            .range(..=start)
+            .next_back()
+            .filter(|(_, (e, _))| *e > start)
+            .map_or_else(HashSet::new, |(_, (_, keys))| keys.clone());
+        use std::ops::Bound::Excluded;
+        for keys in self
+            .starts
+            .range((Excluded(start), Excluded(end)))
+            .map(|(_, keys)| keys)
+        {
+            hits.extend(keys);
+        }
+        hits
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bytes(&self, include: impl Fn(usize) -> bool) -> (u64, u64) {
+        // Sorted by start already: merge the ranges for the union, counting each
+        // included placement once in the sum. Diagnostics exclude aliases and
+        // unrealized descriptions, which own no host copy.
+        let (mut sum, mut union, mut covered) = (0, 0, 0);
+        for (&start, keys) in &self.starts {
+            for key in keys {
+                if !include(*key) {
+                    continue;
+                }
+                let end = self.bounds[key].1;
+                sum += end - start;
+                union += end.saturating_sub(covered.max(start));
+                covered = covered.max(end);
+            }
+        }
+        (sum, union)
+    }
+}
+
+type Placement = (u64, usize);
+
+/// Recent directed displacements are bounded independently of permanent pair
+/// exemptions, so ordinary streaming never fills the exemption budget. If that
+/// budget fills, stop guessing rather than restart a known upload ping-pong.
+#[derive(Default)]
+struct OverlapHistory {
+    released: HashSet<(Placement, Placement)>,
+    order: VecDeque<(Placement, Placement)>,
+    allowed: HashSet<(Placement, Placement)>,
+    saturated: bool,
+    ping_pong: u64,
+}
+
+impl OverlapHistory {
+    const LIMIT: usize = 4096;
+    fn release(&mut self, new: Placement, old: Placement) -> bool {
+        if self.saturated {
+            return false;
+        }
+        let pair = (new.min(old), new.max(old));
+        if self.allowed.contains(&pair) {
+            return false;
+        }
+        if self.released.contains(&(old, new)) {
+            self.ping_pong += 1;
+            if self.allowed.len() == Self::LIMIT {
+                self.saturated = true;
+            } else {
+                self.allowed.insert(pair);
+            }
+            return false;
+        }
+        if self.released.insert((new, old)) {
+            self.order.push_back((new, old));
+            if self.order.len() > Self::LIMIT {
+                self.released.remove(&self.order.pop_front().unwrap());
+            }
+        }
+        true
+    }
+}
+
+pub(super) struct PlacementMemory {
+    ranges: PlacedRanges,
+    overlap: bool,
+    history: OverlapHistory,
+    released_overlap: (u64, u64),
+}
+
+impl Default for PlacementMemory {
+    fn default() -> Self {
+        Self {
+            ranges: PlacedRanges::default(),
+            overlap: std::env::var("VICTORY_PLACED_OVERLAP").as_deref() != Ok("0"),
+            history: OverlapHistory::default(),
+            released_overlap: (0, 0),
+        }
+    }
+}
+
 impl<B: PresentBackend> Title<B> {
     /// Turns copying GPU-written textures back into title memory on or off.
     pub fn set_texture_back(&mut self, on: bool) {
@@ -832,6 +1035,7 @@ impl<B: PresentBackend> Title<B> {
     /// first names it (most of a title's textures are never used), and filled from title memory
     /// when work next goes to the GPU.
     pub fn texture_created(&mut self, key: usize, info: TextureInfo) {
+        self.index_placement(key, &info, self.placement_owner(key));
         self.pending.insert(key, info);
     }
 
@@ -844,6 +1048,7 @@ impl<B: PresentBackend> Title<B> {
         let Some(info) = self.pending.remove(&key) else {
             return false;
         };
+        self.index_placement(key, &info, self.placement_owner(key));
         let Some(desc) = info.desc() else {
             // Loud once per format: views of it get no texture and their draws sample nothing.
             static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
@@ -989,14 +1194,16 @@ impl<B: PresentBackend> Title<B> {
     }
 
     pub fn texture_released(&mut self, key: usize) {
+        self.remove_placement(key);
         self.textures.remove(&key);
         // A placed view that shares this texture ([`Self::alias_placed`]) goes with it.
         if let Some((address, placed)) = self.shared.remove(&key)
             && self.placed.get(&address).is_some_and(|&(k, _)| k == placed)
         {
-            self.placed.remove(&address);
+            self.remove_placement(placed);
             self.host.release_resource(placed);
         }
+        self.shared.retain(|_, (_, placed)| *placed != key);
         self.pending.remove(&key);
         self.unloaded.remove(&key);
         self.hot_keys.retain(|&k| k != key);
@@ -1005,8 +1212,8 @@ impl<B: PresentBackend> Title<B> {
     }
 
     /// A view placed texture `key` at title `address` (in pool `pool`). The title has no object to
-    /// release for it, so the texture another description placed at that address before goes
-    /// now (guess: the title is done with it once it places another there), and every texture
+    /// release for it, so earlier descriptions of reused title bytes go now (a guess; reverse
+    /// displacement exempts overlapping pairs, see docs/native-host.md), and every texture
     /// placed in a pool goes when the pool is released ([`Self::sync_dirty`]).
     pub fn texture_placed(&mut self, address: u64, key: usize, pool: usize) {
         if let Some((old, _)) = self.placed.insert(address, (key, pool))
@@ -1021,9 +1228,73 @@ impl<B: PresentBackend> Title<B> {
                 REPLACED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 REPLACED[1].fetch_add(u64::from(were.contains(&(address, key))), std::sync::atomic::Ordering::Relaxed);
             }
-            self.host.forget_resource(old);
+            self.host.displace_texture(old);
             self.texture_released(old);
         }
+        let owner = self.placement_owner(key);
+        if let Some(info) = self.textures.get(&key).map(|t| &t.info)
+            .or_else(|| self.pending.get(&key))
+            .or_else(|| owner.and_then(|o| self.textures.get(&o).map(|t| &t.info)))
+            .cloned()
+        {
+            self.index_placement(key, &info, owner);
+        }
+    }
+
+    fn placement_owner(&self, key: usize) -> Option<usize> {
+        self.shared
+            .iter()
+            .find(|(_, (_, placed))| *placed == key)
+            .map(|(&object, _)| object)
+    }
+
+    fn remove_placement(&mut self, key: usize) {
+        if let Some(&(address, _)) = self.placement_memory.ranges.bounds.get(&key) {
+            if self.placed.get(&address).is_some_and(|p| p.0 == key) {
+                self.placed.remove(&address);
+            }
+        } else {
+            // Placement can precede its description, or have an empty range.
+            self.placed.retain(|_, (placed, _)| *placed != key);
+        }
+        self.placement_memory.ranges.remove(key);
+    }
+
+    // Guess: another placement intersecting these bytes means the streaming
+    // allocator reused them. Reverse displacement is evidence of live views,
+    // so the pair is exempted instead (docs/native-host.md).
+    fn index_placement(&mut self, key: usize, info: &TextureInfo, owner: Option<usize>) {
+        let address = info.memory as u64;
+        if !self.placed.get(&address).is_some_and(|p| p.0 == key) {
+            return;
+        }
+        if self.placement_memory.overlap {
+            let hits = self.placement_memory.ranges.overlapping(address, info.size);
+            for old in hits {
+                let Some(&(start, _)) = self.placement_memory.ranges.bounds.get(&old) else {
+                    continue;
+                };
+                if old == key
+                    || start == address
+                    || owner.is_some_and(|o| old == o || self.placement_owner(old) == Some(o))
+                {
+                    continue;
+                }
+                if !self
+                    .placement_memory
+                    .history
+                    .release((address, key), (start, old))
+                {
+                    continue;
+                }
+                let bytes = self.textures.get(&old).map_or(0, |t| t.info.size as u64);
+                self.placement_memory.released_overlap.0 += 1;
+                self.placement_memory.released_overlap.1 += bytes;
+                self.host.displace_texture(old);
+                self.texture_released(old);
+            }
+        }
+        self.placement_memory.ranges.insert(key, address, info.size);
     }
 
     /// A placed R9G9B9E5 texture `key` laid out exactly as a live R32_UINT resource object at the
@@ -1051,6 +1322,7 @@ impl<B: PresentBackend> Title<B> {
         };
         let Some(texture) = self.texture_of(obj) else { return false };
         self.host.register_texture(key, &texture);
+        self.index_placement(key, info, Some(obj));
         self.shared.insert(obj, (address, key));
         static ALIASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = ALIASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1077,6 +1349,50 @@ impl<B: PresentBackend> Title<B> {
             self.host.release_resource(key);
             self.texture_released(key);
         }
+    }
+
+    /// Tracked host copies, separated into placed, object and render/depth targets.
+    #[cfg(target_os = "macos")]
+    fn texture_memory_counts(&self) -> [(u64, u64); 3] {
+        let (mut placed, mut object, mut targets) = ((0u64, 0u64), (0u64, 0u64), (0u64, 0u64));
+        for (&key, texture) in &self.textures {
+            let group = if texture.info.render_target() {
+                &mut targets
+            } else if key >> 63 != 0 {
+                &mut placed
+            } else {
+                &mut object
+            };
+            group.0 += 1;
+            group.1 += texture.info.size as u64;
+        }
+        [placed, object, targets]
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn log_texture_memory(&self, frame: u64) {
+        let [placed, object, targets] = self.texture_memory_counts();
+        let m = &self.placement_memory;
+        let (sum, union) = m.ranges.bytes(|key| self.textures.contains_key(&key));
+        tracing::info!(
+            frame,
+            placed = placed.0,
+            placed_bytes = placed.1,
+            object = object.0,
+            object_bytes = object.1,
+            targets = targets.0,
+            target_bytes = targets.1,
+            aliases = self.shared.len(),
+            title_sum = sum,
+            title_union = union,
+            overlap = sum - union,
+            released_overlap = m.released_overlap.0,
+            released_overlap_bytes = m.released_overlap.1,
+            ping_pong = m.history.ping_pong,
+            overlap_exemptions_full = m.history.saturated,
+            pending = self.pending.len(),
+            "texture memory:"
+        );
     }
 
     /// Brings the textures the host samples up to date with title memory: those whose memory
@@ -1450,6 +1766,359 @@ pub type Textures<B> = HashMap<usize, Tracked<B>>;
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    use super::super::vertex_tests::Capture;
+
+    fn placement_title() -> (Title<Capture>, Vec<u8>) {
+        use super::super::memory::{PoolInfo, PoolObserver, PoolTable};
+        let mut bytes = vec![0u8; 16384];
+        let memory = std::sync::Arc::new(PoolTable::default());
+        let pool = PoolInfo {
+            id: bytes.as_ptr() as usize,
+            base: bytes.as_mut_ptr() as usize,
+            len: bytes.len(),
+            memory_entry: None,
+        };
+        memory.pool_created(&pool);
+        memory.mapped(pool.base, pool.len, &pool, 0);
+        let mut title = Title::new(Capture::default(), memory);
+        title.placement_memory.overlap = true;
+        (title, bytes)
+    }
+
+    fn placement_info(address: u64) -> TextureInfo {
+        use victory_formats::texture::{Desc, Swizzle};
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 16,
+            height: 16,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap();
+        TextureInfo {
+            dimension: Dimension::Tex2d,
+            format: 28,
+            width: 16,
+            height: 16,
+            depth_or_layers: 1,
+            flags: 0,
+            size: layout.size as usize,
+            layout,
+            memory: address as *const u8,
+        }
+    }
+
+    fn place(t: &mut Title<Capture>, address: u64, description: &[u32; 14]) -> usize {
+        let key = placed_key(address, description);
+        let pool = t.host.memory().resolve(address, 1).unwrap().0.id;
+        t.texture_placed(address, key, pool);
+        t.texture_created(key, placement_info(address));
+        assert!(t.realize(key));
+        key
+    }
+
+    fn clean_placements(t: &mut Title<Capture>) {
+        let keys: Vec<_> = t.textures.keys().chain(t.pending.keys()).copied().collect();
+        for key in keys {
+            t.host.forget_resource(key);
+            t.texture_released(key);
+        }
+        assert!(t.placed.is_empty());
+        assert!(t.placement_memory.ranges.bounds.is_empty());
+        assert!(t.placement_memory.ranges.spans.is_empty());
+    }
+
+    #[test]
+    fn displaced_placed_textures_clear_heap_entries_at_same_and_different_starts() {
+        for offset in [0, 256] {
+            let (mut t, bytes) = placement_title();
+            let address = bytes.as_ptr() as u64;
+            let words = [3; 14];
+            let old = place(&mut t, address, &words);
+            let weak = Rc::downgrade(&t.textures[&old].texture);
+            let mut slots = [0u32; 16];
+            let handle = slots.as_mut_ptr() as u64;
+            let heap = t.host.heap(HeapKind::Resource, handle, 2).unwrap();
+            let mut view = [0u32; 16];
+            (view[0], view[1], view[5]) = (28, 4, 1);
+            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+            crate::descriptor::create_placed_srv(std::ptr::null_mut(), &words, &view, handle);
+            slots.copy_within(0..8, 8);
+            assert!(t.host.mirror(handle).unwrap());
+            assert!(t.host.mirror(handle + 32).unwrap());
+            let record = slots;
+            place(&mut t, address + offset, &[4; 14]);
+            assert!(weak.upgrade().is_none(), "the old tracked copy is released");
+            assert!(heap.heap.borrow().iter().all(Option::is_none));
+            assert_eq!(t.host.cleared(), 2);
+            assert!(heap.mirrored.borrow().is_empty());
+            assert!(heap.pending_mirror.borrow().is_empty());
+            assert!(
+                heap.take_gone(old).is_empty(),
+                "no permanent-release tombstone remains"
+            );
+            assert_eq!(slots, record, "the title's records stay intact for a retry");
+            clean_placements(&mut t);
+        }
+    }
+
+    #[test]
+    fn placed_overlap_releases_all_intersections_and_keeps_adjacent_ranges() {
+        let (mut t, bytes) = placement_title();
+        let address = bytes.as_ptr() as u64;
+        let size = placement_info(address).size as u64;
+        let first = place(&mut t, address, &[3; 14]);
+        let second = place(&mut t, address + size, &[3; 14]);
+        let adjacent = place(&mut t, address + 2 * size, &[3; 14]);
+        let new = place(&mut t, address + size / 2, &[4; 14]);
+        assert!(!t.host.knows(first) && !t.host.knows(second));
+        assert!(t.host.knows(adjacent) && t.host.knows(new));
+        assert_eq!(t.placement_memory.released_overlap, (2, 2 * size));
+        clean_placements(&mut t);
+    }
+
+    #[test]
+    fn placed_memory_counts_exclude_pending_and_shared_copies() {
+        let (mut t, bytes) = placement_title();
+        let address = bytes.as_ptr() as u64;
+        let size = placement_info(address).size as u64;
+        t.placement_memory.overlap = false;
+        place(&mut t, address, &[3; 14]);
+        place(&mut t, address + 256, &[3; 14]);
+        let owner = address as usize;
+        t.texture_created(
+            owner,
+            TextureInfo {
+                format: 42,
+                ..placement_info(address + 4096)
+            },
+        );
+        assert!(t.realize(owner));
+        let alias = placed_key(address + 4096, &[3; 14]);
+        t.texture_placed(address + 4096, alias, owner);
+        assert!(t.alias_placed(
+            address + 4096,
+            alias,
+            &TextureInfo {
+                format: 67,
+                ..placement_info(address + 4096)
+            }
+        ));
+        let target = owner + 1;
+        t.texture_created(
+            target,
+            TextureInfo {
+                flags: RENDER_TARGET,
+                ..placement_info(address + 8192)
+            },
+        );
+        assert!(t.realize(target));
+        let pending = placed_key(address + 12288, &[3; 14]);
+        t.texture_placed(address + 12288, pending, owner);
+        t.texture_created(pending, placement_info(address + 12288));
+        assert_eq!(
+            t.texture_memory_counts(),
+            [(2, 2 * size), (1, size), (1, size)]
+        );
+        assert_eq!(
+            t.placement_memory
+                .ranges
+                .bytes(|k| t.textures.contains_key(&k)),
+            (2 * size, size + 256)
+        );
+        assert_eq!((t.shared.len(), t.pending.len()), (1, 1));
+        clean_placements(&mut t);
+    }
+
+    #[test]
+    fn placed_overlap_exemption_budget_stops_guessing_without_losing_pairs() {
+        let mut history = OverlapHistory::default();
+        for key in 1..=OverlapHistory::LIMIT {
+            let placement = (key as u64, key);
+            assert!(history.release(placement, (0, 0)));
+            assert!(!history.release((0, 0), placement));
+        }
+        assert!(!history.saturated);
+        let next = (u64::MAX, usize::MAX);
+        assert!(history.release(next, (0, 0)));
+        assert!(!history.release((0, 0), next));
+        assert!(history.saturated);
+        assert_eq!(history.allowed.len(), OverlapHistory::LIMIT);
+        assert!(!history.release((1, 1), (2, 2)));
+    }
+
+    #[test]
+    fn placed_release_before_its_description_removes_the_placement() {
+        let (mut t, bytes) = placement_title();
+        let address = bytes.as_ptr() as u64;
+        let key = placed_key(address, &[3; 14]);
+        t.texture_placed(address, key, address as usize);
+        t.texture_released(key);
+        assert!(t.placed.is_empty());
+        assert!(t.placement_memory.ranges.bounds.is_empty());
+    }
+
+    #[test]
+    fn placed_overlap_at_a_different_start_retires_storage_and_watch() {
+        let (mut t, bytes) = placement_title();
+        let address = bytes.as_ptr() as u64;
+        let old = place(&mut t, address, &[3; 14]);
+        let size = t.textures[&old].info.size;
+        let new = place(&mut t, address + 256, &[3; 14]);
+        assert!(!t.host.knows(old) && !t.textures.contains_key(&old));
+        assert!(!watch(|w| w.entries.contains_key(&old)) && !t.unloaded.contains(&old));
+        assert!(!t.placed.contains_key(&address));
+        assert!(t.host.knows(new));
+        assert_eq!(t.placement_memory.released_overlap, (1, size as u64));
+        clean_placements(&mut t);
+    }
+
+    #[test]
+    fn placed_overlap_reverse_displacement_detects_ping_pong_and_coexists() {
+        let (mut t, bytes) = placement_title();
+        let address = bytes.as_ptr() as u64;
+        let first = place(&mut t, address, &[3; 14]);
+        let second = place(&mut t, address + 256, &[3; 14]);
+        assert!(!t.host.knows(first));
+        assert_eq!(place(&mut t, address, &[3; 14]), first);
+        assert!(t.host.knows(first) && t.host.knows(second));
+        assert_eq!(t.placement_memory.history.ping_pong, 1);
+        let serial = t.textures[&second].serial;
+        // Both future directions are exempt, including explicit placement calls.
+        let pool = t.host.memory().resolve(address, 1).unwrap().0.id;
+        t.texture_placed(address + 256, second, pool);
+        t.texture_placed(address, first, pool);
+        assert_eq!(t.textures[&second].serial, serial);
+        assert_eq!(t.placement_memory.released_overlap.0, 1);
+        clean_placements(&mut t);
+    }
+
+    #[test]
+    fn placed_overlap_leaves_owners_and_aliases_of_the_same_owner() {
+        let (mut t, bytes) = placement_title();
+        let address = bytes.as_ptr() as u64;
+        let owner = address as usize;
+        t.texture_created(
+            owner,
+            TextureInfo {
+                format: 42,
+                ..placement_info(address)
+            },
+        );
+        assert!(t.realize(owner));
+        let first = placed_key(address, &[3; 14]);
+        t.texture_placed(address, first, owner);
+        let info = TextureInfo {
+            format: 67,
+            ..placement_info(address)
+        };
+        assert!(t.alias_placed(address, first, &info));
+        assert_eq!(t.placement_owner(first), Some(owner));
+        // Exercise the owner guard independently of alias_placed's same-address restriction.
+        let second = placed_key(address + 256, &[4; 14]);
+        t.texture_placed(address + 256, second, owner);
+        t.index_placement(second, &placement_info(address + 256), Some(owner));
+        assert!(t.host.knows(first) && t.host.knows(owner));
+        assert_eq!(t.placement_memory.released_overlap.0, 0);
+        t.texture_released(second);
+        // Reusing an alias's bytes may drop that alias, but never its object owner.
+        let third = place(&mut t, address + 512, &[5; 14]);
+        assert!(!t.host.knows(first) && t.host.knows(owner) && t.host.knows(third));
+        assert_eq!(t.placement_memory.released_overlap, (1, 0));
+        clean_placements(&mut t);
+    }
+
+    #[test]
+    fn placed_range_union_handles_containment_endpoints_and_removal() {
+        let mut ranges = PlacedRanges::default();
+        ranges.insert(1, 100, 100);
+        ranges.insert(2, 125, 25);
+        ranges.insert(3, 175, 100);
+        ranges.insert(4, 300, 10);
+        assert_eq!(ranges.bytes(|_| true), (235, 185));
+        assert_eq!(ranges.bytes(|_| true).0 - ranges.bytes(|_| true).1, 50);
+        assert_eq!(ranges.overlapping(150, 25), HashSet::from([1]));
+        assert_eq!(ranges.overlapping(130, 1), HashSet::from([1, 2]));
+        assert!(ranges.overlapping(275, 25).is_empty());
+        assert!(ranges.overlapping(125, 0).is_empty());
+        ranges.remove(2);
+        assert_eq!(ranges.bytes(|_| true), (210, 185));
+        ranges.remove(3);
+        assert_eq!(ranges.spans.len(), 2, "obsolete split points are coalesced");
+        ranges.insert(1, 400, 20);
+        assert_eq!(ranges.bytes(|_| true), (30, 30));
+        assert!(ranges.overlapping(100, 100).is_empty());
+    }
+
+    #[test]
+    fn placed_range_index_matches_live_ranges_after_replacements_and_removals() {
+        let mut ranges = PlacedRanges::default();
+        let mut live = HashMap::new();
+        let mut random = 7u64;
+        for _ in 0..400 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let key = (random >> 32) as usize % 16;
+            let start = (random >> 16) % 64;
+            let size = random as usize % 32;
+            if random & 4 == 0 {
+                ranges.remove(key);
+                live.remove(&key);
+            } else {
+                ranges.insert(key, start, size);
+                live.insert(key, (start, start + size as u64));
+            }
+            for address in 0..96 {
+                let expected = live
+                    .iter()
+                    .filter(|(_, (s, e))| *s <= address && address < *e)
+                    .map(|(&k, _)| k)
+                    .collect();
+                assert_eq!(ranges.overlapping(address, 1), expected);
+            }
+            let union = (0..96)
+                .filter(|a| live.values().any(|(s, e)| s <= a && a < e))
+                .count() as u64;
+            assert_eq!(ranges.bytes(|_| true).1, union);
+        }
+    }
+
+    #[test]
+    fn placed_overlap_can_be_disabled() {
+        let (mut t, bytes) = placement_title();
+        let address = bytes.as_ptr() as u64;
+        t.placement_memory.overlap = false;
+        let first = place(&mut t, address, &[3; 14]);
+        let second = place(&mut t, address + 256, &[3; 14]);
+        assert!(t.host.knows(first) && t.host.knows(second));
+        assert_eq!(t.placement_memory.released_overlap, (0, 0));
+        clean_placements(&mut t);
+    }
+
+    #[test]
+    fn placed_overlap_history_is_bounded_without_stopping_streaming_or_losing_exemptions() {
+        let mut h = OverlapHistory::default();
+        assert!(h.release((1, 1), (2, 2)));
+        assert!(!h.release((2, 2), (1, 1)));
+        for i in 3..2 * OverlapHistory::LIMIT + 3 {
+            assert!(h.release((i as u64, i), (0, 0)));
+        }
+        assert!(
+            !h.saturated,
+            "ordinary streaming only rotates recent history"
+        );
+        assert_eq!(h.released.len(), OverlapHistory::LIMIT);
+        assert_eq!(h.order.len(), OverlapHistory::LIMIT);
+        assert!(
+            !h.release((1, 1), (2, 2)),
+            "exemptions survive history eviction"
+        );
+        assert_eq!(h.ping_pong, 1);
+    }
 
     #[test]
     fn sync_keys_include_overlaps_once_and_keep_unloaded_first() {

@@ -259,8 +259,7 @@ fn a_mesh_shader_loads_a_texture_by_heap_index() {
 
 /// A texture the title releases leaves the heap: the entries showing it are cleared, where they
 /// used to keep the host texture alive and resident until the title wrote another view there.
-/// Entries of other textures stay, and a texture only forgotten (another description placed at
-/// its address) keeps its entries.
+/// Entries of other textures stay, and removing only a resource registration keeps its entries.
 #[test]
 fn a_released_texture_leaves_the_heap() {
     let Some(t) = title() else { return };

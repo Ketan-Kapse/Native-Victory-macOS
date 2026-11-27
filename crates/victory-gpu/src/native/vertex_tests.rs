@@ -129,8 +129,8 @@ impl ResourceBackend for Capture {
     fn write_sampler(&self, _: &Self::Heap, _: usize, _: &(), _: f32) {
         unreachable!()
     }
-    fn clear_entry(&self, _: &Self::Heap, _: usize) {
-        unreachable!()
+    fn clear_entry(&self, heap: &Self::Heap, index: usize) {
+        heap.borrow_mut()[index] = None;
     }
     fn create_texture(&self, desc: &TextureDesc) -> Result<TextureDesc, String> {
         Ok(*desc)
@@ -158,6 +158,18 @@ impl ResourceBackend for Capture {
         unreachable!()
     }
     fn create_sampler(&self, _: &SamplerDesc) -> Result<(), String> {
+        unreachable!()
+    }
+}
+
+impl PresentBackend for Capture {
+    type Surface = ();
+
+    fn create_surface(&self, _: *mut std::ffi::c_void) -> Result<(), String> {
+        unreachable!()
+    }
+
+    fn present(&self, _: &(), _: &(), _: &[&TextureDesc]) -> Result<(), String> {
         unreachable!()
     }
 }

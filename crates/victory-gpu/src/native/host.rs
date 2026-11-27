@@ -664,6 +664,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
+    /// A placed texture's title bytes were reused (a guess, unlike an object's final release).
+    /// Clear retained heap views, but let an unchanged record naming it be checked again when
+    /// its table is next bound. A later registration can then restore that view.
+    pub(super) fn displace_texture(&self, key: usize) {
+        self.release_resource(key);
+        for heap in self.heaps.borrow().iter() {
+            for index in heap.take_gone(key) {
+                heap.mirrored.borrow_mut().remove(&index);
+                heap.pending_mirror.borrow_mut().remove(&index);
+            }
+        }
+    }
+
     /// Heap entries cleared so far because the texture they showed was released.
     pub fn cleared(&self) -> u64 {
         self.cleared.get()
@@ -2387,6 +2400,44 @@ fn table_check_count(slot: usize, binding: Option<&Binding>, floor: usize) -> us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn displaced_texture_records_retry_when_the_table_is_checked() {
+        use super::super::vertex_tests::Capture;
+        let host = NativeHost::new(Capture::default());
+        let texture = Rc::new(TextureDesc::d2(Format::Rgba8Unorm, 4, 4));
+        let key = Rc::as_ptr(&texture) as usize;
+        let mut slots = [0u32; 16];
+        let handle = slots.as_mut_ptr() as u64;
+        let heap = host.heap(HeapKind::Resource, handle, 2).unwrap();
+        host.register_texture(key, &texture);
+        crate::descriptor::create_srv(std::ptr::null_mut(), key as _, std::ptr::null(), handle);
+        slots.copy_within(0..8, 8);
+        let roots = [Some(Root::Table(heap.clone(), 0))];
+        host.remirror_tables(&roots, None);
+        // The backend heap also has reserved entries; only these two title slots
+        // belong to the bound table and should contain this texture.
+        assert!(heap.heap.borrow()[..heap.count].iter().all(Option::is_some));
+        let record = record_at(handle);
+        host.displace_texture(key);
+        assert!(heap.heap.borrow().iter().all(Option::is_none));
+        assert_eq!(host.cleared(), 2);
+        host.remirror_tables(&roots, None);
+        assert_eq!(heap.pending_mirror.borrow().len(), 2, "both unchanged records were retried");
+        assert!(heap.heap.borrow().iter().all(Option::is_none), "no registered copy yet");
+        host.register_texture(key, &texture);
+        host.remirror_tables(&roots, None);
+        assert!(heap.heap.borrow()[..heap.count].iter().all(Option::is_some));
+        assert_eq!(record_at(handle), record, "recovery needs no descriptor write");
+        // Final object release still suppresses the old record until it is rewritten or
+        // the key registered again; displacement does not change that contract.
+        host.release_resource(key);
+        host.remirror_tables(&roots, None);
+        assert!(heap.pending_mirror.borrow().is_empty());
+        assert!(heap.heap.borrow().iter().all(Option::is_none));
+        crate::descriptor::forget(key);
+    }
 
     #[test]
     fn table_check_count_uses_shader_metadata_above_default() {

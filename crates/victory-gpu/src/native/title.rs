@@ -227,6 +227,7 @@ pub struct Title<B: PresentBackend> {
     pub(super) pending: HashMap<usize, super::textures::TextureInfo>,
     /// Textures placed in title memory (no resource object), by address: their key and pool.
     pub(super) placed: HashMap<u64, (usize, usize)>,
+    pub(super) placement_memory: super::textures::PlacementMemory,
     /// Resource objects whose host texture a placed view names too: its address and key.
     pub(super) shared: HashMap<usize, (u64, usize)>,
     queues: HashMap<usize, Rc<B::Queue>>,
@@ -266,6 +267,7 @@ impl<B: PresentBackend> Title<B> {
             surface: None,
             pending: HashMap::new(),
             placed: HashMap::new(),
+            placement_memory: Default::default(),
             shared: HashMap::new(),
             queues: HashMap::new(),
             fences: HashMap::new(),
