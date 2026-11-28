@@ -44,6 +44,13 @@ impl<T> Paged<T> {
             .as_ref()
     }
 
+    /// The made page slot `index` is in (none: not made, or past the end) and the index of its
+    /// first slot: a run of neighbouring slots is read without finding the page again.
+    pub(crate) fn page_of(&self, index: usize) -> Option<(usize, &[Option<T>])> {
+        let page = self.pages.get(index / PAGE)?.as_deref()?;
+        Some((index - index % PAGE, page))
+    }
+
     /// The slots that hold something, in order, with their indices: the
     /// pages made are walked, the others skipped.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &T)> {

@@ -13,8 +13,7 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 // Also built for tests, which run where `host` cannot.
-#[cfg(any(windows, test))]
-mod paged;
+pub(crate) mod paged;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -564,7 +563,7 @@ pub(crate) fn record(handle: u64, view: View) {
     #[cfg(windows)]
     mirror(handle);
     #[cfg(target_os = "macos")]
-    crate::native::glue::mirror(handle);
+    crate::native::glue::mirror(handle, true);
 }
 
 /// A shader-visible heap's descriptor memory: its start, whether it holds samplers, and its
@@ -635,10 +634,62 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    let record = unsafe { (handle as *const [u8; 12]).read_unaligned() };
+    view_record(record)
+}
+
+/// [`view`] without a copy of the view: `f` reads it in place, under the view table's lock, so
+/// it must not record, forget or look up views itself.
+#[cfg(target_os = "macos")]
+pub(crate) fn with_view<R>(handle: u64, f: impl FnOnce(Option<&View>) -> R) -> R {
+    if handle == 0 {
+        return f(None);
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let record = unsafe { (handle as *const [u8; 12]).read_unaligned() };
+    f(view_records().get(record).ok())
+}
+
+/// The view table, locked: the views of many records (a bound table's) are read in place under
+/// one lock. Held only to decode: dropped before anything that can record or forget a view.
+pub(crate) struct ViewRecords(std::sync::MutexGuard<'static, Views>);
+
+/// Why a record names no view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordError {
+    /// Twelve zero bytes.
+    Empty,
+    /// Not a view record.
+    Foreign,
+    /// A record of a view whose resource was released since.
+    Stale,
+}
+
+pub(crate) fn view_records() -> ViewRecords {
+    ViewRecords(VIEWS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+impl ViewRecords {
+    /// The view `record` (tag, index, generation) names, if it is current.
+    pub(crate) fn get(&self, record: [u8; 12]) -> Result<&View, RecordError> {
+        let [tag, i, generation] = std::array::from_fn(|n| {
+            u32::from_le_bytes(record[n * 4..][..4].try_into().expect("record word"))
+        });
+        if tag != VIEW_TAG {
+            return Err(if record == [0; 12] { RecordError::Empty } else { RecordError::Foreign });
+        }
+        let (view, current) = self.0.list.get(i as usize).ok_or(RecordError::Stale)?;
+        if *current != generation {
+            return Err(RecordError::Stale);
+        }
+        Ok(view)
+    }
+}
+
+/// Decode the exact record already read by a native table scan. Re-reading the title's slot
+/// here could pair a newer view with the older bytes saved in its mirror stamp.
+pub(crate) fn view_record(record: [u8; 12]) -> Option<View> {
+    view_records().get(record).ok().cloned()
 }
 
 /// A description of `N` words, if the title passes one.
@@ -718,9 +769,17 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
 
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
-    let Some(step) = increment(kind).map(u64::from) else {
-        return;
-    };
+    if let Some(range) = copy_range(count, dst, src, kind) {
+        #[cfg(target_os = "macos")]
+        crate::native::glue::mirror_ranges(&[range]);
+        #[cfg(not(target_os = "macos"))]
+        let _ = range;
+    }
+}
+
+/// Copy title bytes immediately; callers batch native mirrors after all their ranges are copied.
+fn copy_range(count: u32, dst: u64, src: u64, kind: u32) -> Option<(u64, u32, u64)> {
+    let step = increment(kind).map(u64::from)?;
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
@@ -729,11 +788,9 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
         }
-        #[cfg(target_os = "macos")]
-        for i in 0..u64::from(count) {
-            crate::native::glue::mirror(dst + i * step);
-        }
+        return Some((dst, count, step));
     }
+    None
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
@@ -773,18 +830,21 @@ pub(crate) extern "system" fn copy(
     let src = ranges(src_ranges, src_starts, src_sizes);
     let mut dst = ranges(dst_ranges, dst_starts, dst_sizes).into_iter();
     let (mut to, mut room) = dst.next().unwrap_or((0, 0));
-    for (mut from, mut left) in src {
+    let mut mirrored = Vec::new();
+    'ranges: for (mut from, mut left) in src {
         while left > 0 {
             while room == 0 {
-                let Some(next) = dst.next() else { return };
+                let Some(next) = dst.next() else { break 'ranges };
                 (to, room) = next;
             }
             let n = left.min(room);
-            copy_simple(std::ptr::null(), n, to, from, kind);
+            if let Some(range) = copy_range(n, to, from, kind) { mirrored.push(range); }
             let bytes = u64::from(n) * u64::from(step);
             (to, from, room, left) = (to + bytes, from + bytes, room - n, left - n);
         }
     }
+    #[cfg(target_os = "macos")]
+    crate::native::glue::mirror_ranges(&mirrored);
 }
 
 /// The view recorded at `handle`, if one is.
@@ -864,7 +924,7 @@ pub(crate) extern "system" fn create_heap(
     }
     #[cfg(target_os = "macos")]
     if visible {
-        crate::native::glue::heap_created(start, desc.kind == SAMPLERS, desc.count as usize);
+        crate::native::glue::heap_created(start, desc.kind == SAMPLERS, desc.count as usize, !placed);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = visible;

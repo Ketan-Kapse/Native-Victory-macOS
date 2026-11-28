@@ -15,6 +15,9 @@ use victory_backend::resources::{
 /// `(record, pool_generation, resources_epoch)` of a heap entry whose mirror attempt has not completed yet.
 type PendingMirror = ([u8; 12], u64, u64);
 
+pub type MirrorStamps = super::entries::Entries<super::host::MirrorStamp>;
+use super::entries::Entries;
+
 /// Per-entry bitsets of buffer views written by `NativeHost::mirror` that have not yet materialized
 /// a backend `texture_buffer` view (`typed`: all typed and 4-, 8-, or 16-byte structured views;
 /// `explicit`: `stride == 0` typed views). Two bits per entry (~10 KiB for a 40,000-entry heap).
@@ -60,6 +63,10 @@ impl PendingTyped {
 
     pub fn count(&self) -> usize {
         self.typed.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    pub fn is_explicit(&self, index: usize) -> bool {
+        self.explicit.get(index >> 6).is_some_and(|w| (w >> (index & 63)) & 1 != 0)
     }
 
     pub fn has_explicit(&self) -> bool {
@@ -135,12 +142,26 @@ pub struct NativeHeap<B: GraphicsBackend> {
     /// entry, see `NativeHost::view_addresses`), made the first time a shader reads them and kept
     /// current by every mirrored write after that.
     pub addresses: std::cell::RefCell<Option<Rc<super::addr::Pages<B>>>>,
-    /// The title record (tag, view index, generation) each entry was last mirrored from.
-    pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, [u8; 12]>>,
+    /// Successful mirrors, including the mappings/resource identities they resolved against.
+    pub mirrored: std::cell::RefCell<MirrorStamps>,
     /// Entries whose last mirror attempt could not complete yet, keyed by `(record, pool_gen, res_gen)`
     /// so unchanged entries are retried only once the pool table or registered resources change.
-    pub pending_mirror: std::cell::RefCell<std::collections::HashMap<usize, PendingMirror>>,
+    pub pending_mirror: std::cell::RefCell<Entries<PendingMirror>>,
     pub images: std::cell::RefCell<Shown>,
+    /// The entries that show a buffer view through a span buffer (`NativeHost::span`): which
+    /// span, and which of its buffers. Written again when the title maps the range differently.
+    pub spanned: std::cell::RefCell<Entries<super::host::SpanRef>>,
+    /// The entries given the null view because their buffer view's memory was not mapped: tried
+    /// again when the pool table changes.
+    pub unmapped: std::cell::RefCell<std::collections::BTreeSet<usize>>,
+    /// The entries that show a plane of a depth texture's writable twin (an unordered access
+    /// view of the depth texture, `NativeHost::twin_plane`), with the depth texture's key.
+    pub twin_uavs: std::cell::RefCell<Entries<usize>>,
+    /// Colour reads that follow an existing twin, without marking it written.
+    pub twin_srvs: std::cell::RefCell<Entries<usize>>,
+    /// The entries that show a depth texture itself (a shader resource view), with its key:
+    /// what a use reads once the texture has a twin.
+    pub depth_srvs: std::cell::RefCell<Entries<usize>>,
     /// With `VICTORY_TRACE_HEAP_SET`: the frame (+1; 0: never) each entry was last inside a table a
     /// draw or dispatch bound (diagnostics).
     pub used: std::cell::RefCell<Vec<u32>>,
@@ -149,10 +170,26 @@ pub struct NativeHeap<B: GraphicsBackend> {
     /// `Some` for a view one pool run holds or a wrap of the title's own pages, `None` for the
     /// null view a gap left. The host mirrors such an entry again when that changes
     /// (`NativeHost::follow_title_pages`).
-    pub title_views: std::cell::RefCell<std::collections::HashMap<usize, TitleView>>,
+    pub title_views: std::cell::RefCell<Entries<TitleView>>,
     /// Unmaterialized `texture_buffer` entry bits set by `NativeHost::mirror` and promoted lazily
     /// at draw or dispatch when a bound shader uses DXIL `TypedBuffer` operations.
     pub typed_pending: std::cell::RefCell<PendingTyped>,
+    /// Whether the title's records of this heap can be read with plain loads
+    /// (`NativeHost::records_readable`).
+    pub records: std::cell::Cell<Records>,
+}
+
+/// How the host may read a heap's descriptor records (the title's memory at `NativeHeap::start`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Records {
+    /// Memory the title placed the heap in, or of unknown origin: `Some((scope, readable))`
+    /// once the whole range was asked of the kernel in preparation scope `scope`.
+    Title(Option<(u64, bool)>),
+    /// Memory the descriptor heap object itself owns: mapped until the title releases the heap,
+    /// which reaches `NativeHost::drop_heap` first, under the host's lock.
+    Owned,
+    /// The title released the heap: lists that still bind it read through the kernel.
+    Released,
 }
 
 /// A heap buffer view over title memory: its address, length and the signature of the mappings
@@ -161,12 +198,17 @@ pub type TitleView = (u64, u64, Option<u64>);
 
 /// The title texture each heap entry shows (`of`), and each texture's entries (`entries`; those
 /// may be stale: an entry counts only while `of` still names the texture).
-#[derive(Default)]
 pub struct Shown {
-    of: std::collections::HashMap<usize, usize>,
+    of: Entries<usize>,
     entries: std::collections::HashMap<usize, Vec<usize>>,
     /// The entries cleared when a texture was released, by its object's address.
     gone: std::collections::HashMap<usize, Vec<usize>>,
+}
+
+impl Shown {
+    pub fn new(count: usize, dense: bool) -> Self {
+        Self { of: Entries::new(count, dense), entries: Default::default(), gone: Default::default() }
+    }
 }
 
 impl<B: GraphicsBackend> NativeHeap<B> {
@@ -183,6 +225,21 @@ impl<B: GraphicsBackend> NativeHeap<B> {
                 of.remove(&index);
             }
         }
+    }
+
+    pub fn mark_mirrored(&self, index: usize, stamp: super::host::MirrorStamp) {
+        let mut pending = self.pending_mirror.borrow_mut();
+        if !pending.is_empty() { pending.remove(&index); }
+        self.mirrored.borrow_mut().insert(index, stamp);
+    }
+
+    pub fn shown(&self, index: usize) -> Option<usize> {
+        self.images.borrow().of.get(&index).copied()
+    }
+
+    /// Every entry that shows a title texture, with the texture's key (`VICTORY_TRACE_STALE`).
+    pub fn shown_entries(&self) -> Vec<(usize, usize)> {
+        self.images.borrow().of.iter().map(|(i, &k)| (i, k)).collect()
     }
 
     /// Whether an entry shows title texture `resource`.
@@ -205,6 +262,17 @@ impl<B: GraphicsBackend> NativeHeap<B> {
             gone.insert(resource, listed.clone());
         }
         listed
+    }
+
+    /// The title texture entry `index` shows now, if any.
+    pub fn shows_at(&self, index: usize) -> Option<usize> {
+        self.images.borrow().of.get(&index).copied()
+    }
+
+    /// The entries that show title texture `resource` now.
+    pub fn entries_of(&self, resource: usize) -> Vec<usize> {
+        let Shown { of, entries, .. } = &*self.images.borrow();
+        entries.get(&resource).map(|e| e.iter().copied().filter(|i| of.get(i) == Some(&resource)).collect()).unwrap_or_default()
     }
 
     /// The entries [`Self::take_entries`] took when the texture last at `resource` was released,
@@ -248,8 +316,15 @@ pub struct Binding {
     /// Whether the shader both uses `TypedBuffer` operations and indexes
     /// `ResourceDescriptorHeap` directly (`HostShader::heap`).
     pub heap_typed_buffers: bool,
+    /// Whether the shader takes views from the resource heap at indices it computes
+    /// (`HostShader::heap`): which ones, no table says (`bake.rs`).
+    pub heap: bool,
     /// The pipeline's name (its shaders' hashes), for diagnostics.
     pub name: Rc<str>,
+    /// A described pipeline's rectangle-list variant whose vertex shader fetches stage-in
+    /// attributes (`state::rect_strip`): its draws are four-vertex strip instances, a rectangle
+    /// each, as a guessed pipeline's rectangles are.
+    pub rect_strip: bool,
 }
 
 /// A root view's kind.
@@ -297,7 +372,9 @@ impl Binding {
                 .collect(),
             typed_buffers,
             heap_typed_buffers: typed_buffers && shader.heap,
+            heap: shader.heap,
             name: "".into(),
+            rect_strip: false,
         }
     }
 
@@ -938,10 +1015,25 @@ impl<B: GraphicsBackend> NativeList<B> {
         (&self.state.graphics_root, self.state.graphics_binding.as_deref())
     }
 
+    /// The resource heap `SetDescriptorHeaps` bound last: the one a shader that takes views
+    /// from the heap at indices it computes reads.
+    #[cfg(target_os = "macos")]
+    pub(super) fn resource_heap(&self) -> Option<&Rc<NativeHeap<B>>> {
+        self.state.heaps.0.as_ref()
+    }
+
     /// The compute root parameters the next dispatch takes (for traces).
     #[cfg(target_os = "macos")]
     pub(super) fn compute_args(&self) -> &[Option<Root<B>>] {
         &self.state.compute_root
+    }
+
+    /// Replacing scalar root state is local to this list, except when it would drop a table's
+    /// shared Rc. Inspecting the discriminant does not touch that Rc's reference count.
+    #[cfg(target_os = "macos")]
+    pub(super) fn plain_root(&self, compute: bool, slot: usize) -> bool {
+        let roots = if compute { &self.state.compute_root } else { &self.state.graphics_root };
+        !matches!(roots.get(slot), Some(Some(Root::Table(..))))
     }
 
     /// `Reset`: forget everything recorded and set.
@@ -1419,8 +1511,9 @@ impl<B: GraphicsBackend> NativeList<B> {
             root: self.state.graphics_root.clone(),
             heaps: self.state.heaps.clone(),
             targets: self.state.targets.clone(),
-            vertex: self.state.vertex.iter().map(|(&slot, &addr)| (slot, addr)).collect(),
-            index: self.state.index,
+            // A mesh dispatch reads no vertex or index buffers: stale ones are not resolved.
+            vertex: if matches!(call, DrawCall::Mesh { .. }) { Vec::new() } else { self.state.vertex.iter().map(|(&slot, &addr)| (slot, addr)).collect() },
+            index: if matches!(call, DrawCall::Mesh { .. }) { None } else { self.state.index },
             state: self.state.draw,
             call,
             indirect,

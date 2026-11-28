@@ -747,7 +747,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
-        mesh_stride: 0,
+        mesh_stride: 0, mesh_fit: Default::default(),
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
@@ -755,6 +755,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
         view_marks: false,
     })?;
     Ok(HostShader {

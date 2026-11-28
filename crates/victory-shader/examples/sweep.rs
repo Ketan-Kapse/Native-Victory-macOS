@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use victory_shader::ShaderError;
 use victory_shader::emit::{HostShader, Options, translate_with};
 
-const USAGE: &str = "usage: sweep <folder> [-j N] [--list FILE] [--show] [--timeout SECONDS]";
+const USAGE: &str = "usage: sweep <folder> [-j N] [--list FILE] [--show] [--timeout SECONDS] [--no-if-convert] [--no-sync-loops] [--no-comm-waves]";
 
 fn main() {
     let usage = || -> ! {
@@ -23,6 +23,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next().filter(|a| !a.starts_with('-')) else { usage() };
     let (mut jobs, mut list, mut show, mut limit) = (4usize, None, false, 120u64);
+    let mut options = Options { wave32_host: true, zero_copy_memory: true, ..Default::default() };
     while let Some(a) = args.next() {
         let mut number = || args.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or_else(|| usage());
         match a.as_str() {
@@ -33,6 +34,9 @@ fn main() {
             "--show" => show = true,
             // Seconds one shader may take: past that its line says "timeout" and the sweep goes on.
             "--timeout" => limit = number(),
+            "--no-if-convert" => options.no_if_convert = true,
+            "--no-sync-loops" => options.no_sync_loops = true,
+            "--no-comm-waves" => options.no_comm_waves = true,
             _ => usage(),
         }
     }
@@ -49,7 +53,6 @@ fn main() {
     // A translation that panics is a line of the sweep, not a message for each on stderr.
     std::panic::set_hook(Box::new(|_| {}));
     // The native host's options (`victory-gpu`, `native::shaders::translate`).
-    let options = Options { wave32_host: true, zero_copy_memory: true, ..Default::default() };
     let lines = sweep(dir, names, jobs, Duration::from_secs(limit), show, move |c| translate_with(c, options));
     let mut text = String::new();
     let mut counts = std::collections::BTreeMap::new();

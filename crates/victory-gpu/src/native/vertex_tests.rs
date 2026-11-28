@@ -42,6 +42,27 @@ pub(super) struct Capture {
     pub(super) refuse: std::cell::RefCell<Option<(bool, Vec<usize>)>>,
 }
 
+pub(super) enum CapturedDescriptor {
+    Buffer(usize, usize, u32),
+    Texture(TextureDesc),
+}
+
+impl super::host::DescriptorBackend for Capture {
+    type Descriptor = CapturedDescriptor;
+    fn capture_descriptor(&self, heap: &Self::Heap, index: usize) -> Self::Descriptor {
+        if let Some(t) = heap.borrow()[index] { return CapturedDescriptor::Texture(t); }
+        let writes = self.buffer_writes.borrow();
+        let &(_, base, ptr, size) = writes.iter().rev().find(|w| w.0 == index).expect("written entry");
+        CapturedDescriptor::Buffer(base, ptr, size)
+    }
+    fn write_descriptor(&self, heap: &Self::Heap, index: usize, entry: &Self::Descriptor) {
+        match entry {
+            CapturedDescriptor::Buffer(base, ptr, size) => self.write_buffer(heap, index, base, *ptr as *const u8, *size),
+            CapturedDescriptor::Texture(t) => self.write_texture(heap, index, t, 0.0),
+        }
+    }
+}
+
 impl GraphicsBackend for Capture {
     type RenderPipeline = ();
 
@@ -130,7 +151,8 @@ impl ResourceBackend for Capture {
     fn heap_address(&self, _: &Self::Heap, index: usize) -> u64 {
         (index * 32) as u64
     }
-    fn write_buffer(&self, _: &Self::Heap, index: usize, base: &usize, address: *const u8, size: u32) {
+    fn write_buffer(&self, heap: &Self::Heap, index: usize, base: &usize, address: *const u8, size: u32) {
+        heap.borrow_mut()[index] = None;
         self.buffer_writes.borrow_mut().push((index, *base, address as usize, size));
     }
     fn write_texture(&self, heap: &Self::Heap, slot: usize, tex: &TextureDesc, _: f32) {

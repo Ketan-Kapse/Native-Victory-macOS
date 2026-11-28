@@ -73,6 +73,24 @@ fn a_mesh_style_vertex_program_makes_a_mesh_pipeline() {
     assert_eq!(pso.mesh_threads(), Some([128, 1, 1]));
 }
 
+#[test]
+fn an_over_limit_mesh_keeps_its_dispatch_refusal_reason() {
+    use crate::native::title::MeshRefusal;
+    let mut ms = translate(HwStage::Vs, TRIANGLE);
+    // Raise the declared maximum in our synthetic shader so no conversion is attempted.
+    let offset = {
+        let c = victory_shader::Container::parse(&ms.dxil).unwrap();
+        c.part(victory_shader::FourCC::PSV0).unwrap().data.as_ptr() as usize - ms.dxil.as_ptr() as usize
+    };
+    ms.dxil[offset + 16..offset + 18].copy_from_slice(&4096u16.to_le_bytes());
+    assert!(shaders::metal_mesh_bytes(&ms.dxil).unwrap() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES);
+    let Some(mut t) = title() else { return };
+    let guessed = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    for state in [Graphics::default(), guessed] {
+        assert!(matches!(t.render_pipe(&ms, None, &state, "large mesh"), Pipe::MeshRefused(MeshRefusal::OverLimit)));
+    }
+}
+
 /// An 8x8 RGBA8 target cleared to black, `pso` and `binding` set on a list.
 fn list_into(
     t: &Title<Metal>,
@@ -801,9 +819,10 @@ fn a_pixel_program_writes_exact_bits_to_an_r32uint_target() {
     let ms = translate(HwStage::Vs, TRIANGLE);
     let Some(mut t) = title() else { return };
     let state = Graphics::guess_base().for_draw(formats.to_vec(), None, vec![], &[], false);
-    // Translated as today (float outputs), Metal refuses it.
+    // Float outputs mismatch the integer attachment: a mesh conversion refusal.
     let float = shaders::translate(&c).unwrap();
-    assert!(matches!(t.render_pipe(&ms, Some(&float), &state, "float"), Pipe::Refused));
+    assert!(matches!(t.render_pipe(&ms, Some(&float), &state, "float"),
+        Pipe::MeshRefused(crate::native::title::MeshRefusal::ConversionFailed)));
     assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("color attachment")), "{:?}", t.shaders.refused);
     let ps = shaders::translate_targets(&c, integer).unwrap();
     let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "integer") else {
@@ -963,5 +982,201 @@ fn barycentrics_read_as_data_weigh_the_second_and_third_corners() {
             assert!((f32::from(p[c]) - want[c]).abs() <= 1.0, "texel {n}: {p:?}, want {want:?}");
         }
         assert_eq!(&p[2..], &[0, 255], "texel {n}");
+    }
+}
+
+/// Mesh programs over Metal's mesh output limit (32,768 bytes of outputs a thread group), linked
+/// to their pixel programs and made to fit (`victory_shader::emit::translate_fitted`): what
+/// they draw is compared, bit for bit, with the same programs declared small enough to fit as
+/// they are. Our own programs (`victory_shader::native::synthetic`): 56 triangles that overlap
+/// nowhere, whose pixel program weighs every channel of every parameter differently.
+mod over_limit {
+    use super::*;
+    use crate::native::title::MeshRefusal;
+    use victory_shader::emit::{Fitted, HostShader, METAL_MESH_OUTPUT_BYTES, metal_mesh_bytes};
+    use victory_shader::native::synthetic;
+
+    const SIDE: usize = 16;
+
+    /// One group of mesh program `passes` (drawn one after the other when there are several)
+    /// with pixel program `ps`, into a 16 x 16 float target cleared to zero: the target's bytes
+    /// and the pipeline's passes.
+    fn drawn(t: &mut Title<Metal>, passes: &[&HostShader], ps: &HostShader) -> Result<(Vec<u8>, usize), Pipe<Metal>> {
+        let state = Graphics::guess_base().for_draw(vec![Format::Rgba32Float], None, vec![], &[], false);
+        let (pso, binding) = match t.render_pipe_passes(passes[0], &passes[1..], Some(ps), &state, "mesh over the limit") {
+            Pipe::Render(pso, binding) => (pso, binding),
+            other => return Err(other),
+        };
+        let mut desc = TextureDesc::d2(Format::Rgba32Float, SIDE, SIDE);
+        desc.render_target = true;
+        let color = t.host.texture(&desc).unwrap();
+        let mut list = NativeList::default();
+        list.set_render_targets(std::slice::from_ref(&color), None);
+        list.clear_render_target(&color, [0.0; 4]);
+        list.set_graphics_pipeline(&pso, Topology::Triangles);
+        list.set_graphics_binding(binding);
+        list.dispatch_mesh(1, 1, 1).unwrap();
+        super::super::run(&t.host, &[&list]);
+        let mut bytes = vec![0; SIDE * SIDE * 16];
+        t.host.backend.read_texture(&color, 0, 0, &mut bytes, SIDE * 16, 0);
+        Ok((bytes, pso.mesh_passes()))
+    }
+
+    /// The grid pair of `rows` parameter rows declared with `max_vertices` vertices, linked (and
+    /// fitted, if `fit`) as the host links a pipeline's mesh and pixel programs.
+    fn linked(rows: u8, split: bool, max_vertices: u16, fit: bool) -> crate::pipeline::Linked {
+        let (ms, ps) = synthetic::grid_pair(rows, split, max_vertices);
+        crate::pipeline::link(&ms, Some(&ps), fit).unwrap()
+    }
+
+    fn picture(t: &mut Title<Metal>, l: &crate::pipeline::Linked) -> (Vec<u8>, usize) {
+        let passes: Vec<&HostShader> = l.passes.iter().map(|p| &**p).collect();
+        match drawn(t, &passes, l.pixel.as_deref().unwrap()) {
+            Ok(made) => made,
+            Err(_) => panic!("{:?}", t.shaders),
+        }
+    }
+
+    /// The pixels a picture's triangles cover (the target was cleared to zero, and every
+    /// triangle writes something else), and that the picture is a picture: finite values that
+    /// differ from pixel to pixel.
+    fn covered(bytes: &[u8]) -> Vec<bool> {
+        let pixels: Vec<[f32; 4]> = bytes
+            .chunks_exact(16)
+            .map(|p| std::array::from_fn(|c| f32::from_le_bytes(p[4 * c..4 * c + 4].try_into().unwrap())))
+            .collect();
+        assert!(pixels.iter().flatten().all(|v| v.is_finite()));
+        pixels.iter().map(|p| *p != [0.0; 4]).collect()
+    }
+
+    /// The reference: the program declared with the 64 vertices it stores fits as linked, and
+    /// draws its grid (four of the seven columns of cells, all seven rows).
+    fn reference(t: &mut Title<Metal>, rows: u8, split: bool) -> Vec<u8> {
+        let l = linked(rows, split, 64, true);
+        assert_eq!(l.fit, Fitted::AsLinked);
+        let (bytes, passes) = picture(t, &l);
+        assert_eq!(passes, 1);
+        let covered = covered(&bytes);
+        let count = covered.iter().filter(|c| **c).count();
+        assert!((120..=160).contains(&count), "the grid covers 4/7 of the target: {count} of 256 pixels");
+        let distinct: std::collections::HashSet<&[u8]> = bytes.chunks_exact(16).collect();
+        assert!(distinct.len() > count / 2, "interpolated values differ: {} distinct", distinct.len());
+        bytes
+    }
+
+    /// Outputs that are over the limit only through the padding of their declared order (eleven
+    /// rows of a float3 and a float: 280 bytes a vertex, 35,840 a group) are declared in the
+    /// tightest order (192 bytes, 24,576) and draw what the in-limit program draws.
+    #[test]
+    fn reordered_outputs_draw_what_the_declared_order_draws() {
+        let Some(mut t) = title() else { return };
+        let expected = reference(&mut t, 11, true);
+        let l = linked(11, true, 128, true);
+        assert_eq!(l.fit, Fitted::Reordered { from: 35_840, bytes: 24_576 });
+        let (bytes, passes) = picture(&mut t, &l);
+        assert_eq!(passes, 1);
+        assert!(bytes == expected, "the reordered program draws another picture");
+        assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    }
+
+    /// Outputs over the limit in any order are drawn in four passes of fewer vertices: sixteen
+    /// float4 rows (272 bytes a vertex), and sixteen rows of a float3 and a float (400 bytes as
+    /// declared, 272 reordered). The four passes together draw what the in-limit program draws;
+    /// each pass alone draws a part of it, no two of them the same pixel.
+    #[test]
+    fn a_program_split_in_passes_draws_what_the_whole_program_draws() {
+        let Some(mut t) = title() else { return };
+        for split in [false, true] {
+            let expected = reference(&mut t, 16, split);
+            let l = linked(16, split, 128, true);
+            assert!(matches!(l.fit, Fitted::Split { excluded: 8, bytes: 32_640, .. }), "{:?}", l.fit);
+            assert_eq!(l.passes.len(), 4);
+            for pass in &l.passes {
+                assert!(metal_mesh_bytes(&pass.dxil).unwrap() <= METAL_MESH_OUTPUT_BYTES);
+            }
+            let (bytes, passes) = picture(&mut t, &l);
+            assert_eq!(passes, 4);
+            assert!(bytes == expected, "split {split}: the passes together draw another picture");
+            assert_eq!(t.shaders.mesh_split, 1 + u64::from(split));
+
+            // Each pass by itself, as a pipeline of one pass.
+            let whole = covered(&expected);
+            let mut seen = vec![false; whole.len()];
+            for (n, pass) in l.passes.iter().enumerate() {
+                let (part, _) = drawn(&mut t, &[&**pass], l.pixel.as_deref().unwrap()).ok().unwrap();
+                let part_covered = covered(&part);
+                assert!(part_covered.iter().any(|c| *c), "pass {n} draws nothing");
+                for (i, _) in part_covered.iter().enumerate().filter(|c| *c.1) {
+                    assert!(whole[i] && !seen[i], "pass {n} draws pixel {i} that is not its own");
+                    assert!(part[16 * i..16 * i + 16] == expected[16 * i..16 * i + 16], "pass {n}, pixel {i}");
+                    seen[i] = true;
+                }
+            }
+            assert!(seen == whole, "the passes leave pixels out");
+        }
+        assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    }
+
+    /// With the fitting off (`VICTORY_MESH_FIT=0`) such a program is left as linked and refused
+    /// with its size, as before; so is a program whose outputs are too large even for passes.
+    #[test]
+    fn a_program_that_is_not_fitted_is_refused_with_its_size() {
+        let Some(mut t) = title() else { return };
+        let state = Graphics::guess_base().for_draw(vec![Format::Rgba32Float], None, vec![], &[], false);
+        for (rows, fit, bytes) in [(16, false, 128 * 272), (22, true, 128 * 368)] {
+            let l = linked(rows, false, 128, fit);
+            assert_eq!(l.passes.len(), 1);
+            assert_eq!(metal_mesh_bytes(&l.passes[0].dxil), Some(bytes));
+            assert_eq!(l.fit, if fit { Fitted::TooLarge { from: bytes, bytes } } else { Fitted::AsLinked });
+            let pipe = t.render_pipe(&l.passes[0], l.pixel.as_deref(), &state, &format!("mesh of {rows} rows"));
+            assert!(matches!(pipe, Pipe::MeshRefused(MeshRefusal::OverLimit)));
+            assert!(
+                t.shaders.refused.iter().any(|(why, _)| why.contains(&format!("mesh of {rows} rows: mesh outputs {bytes} bytes exceed"))),
+                "{:?}",
+                t.shaders.refused
+            );
+        }
+    }
+
+    /// A mesh program's linked translation is kept per pixel partner: what it keeps of its
+    /// outputs, their order and its passes depend on what the pixel program reads. One partner
+    /// here reads all sixteen rows (the mesh program is split), one reads four (it fits).
+    #[test]
+    fn a_linked_translation_is_kept_by_the_mesh_and_the_pixel_program() {
+        use crate::pipeline::{link, link_key};
+        let (ms, all) = synthetic::grid_pair(16, false, 128);
+        let few = synthetic::pixel(&synthetic::weighted_pixel_code(4), 4, &synthetic::row_elements(4, false, false));
+        let keys = [link_key(&ms, Some(&all)), link_key(&ms, Some(&few)), link_key(&ms, None)];
+        assert!(keys[0] != keys[1] && keys[0] != keys[2] && keys[1] != keys[2]);
+        assert_eq!(link_key(&ms, Some(&all)), keys[0]);
+        let (with_all, with_few) = (link(&ms, Some(&all), true).unwrap(), link(&ms, Some(&few), true).unwrap());
+        assert_eq!((with_all.passes.len(), with_few.passes.len()), (4, 1));
+        assert_eq!(with_few.fit, Fitted::AsLinked);
+        assert_ne!(with_all.passes[0].dxil, with_few.passes[0].dxil);
+        // The four-row partner's picture is drawn by the unsplit program.
+        let Some(mut t) = title() else { return };
+        let (_, passes) = picture(&mut t, &with_few);
+        assert_eq!(passes, 1);
+    }
+
+    /// A pipeline of passes is one pipeline of the host's library, kept by all its passes: the
+    /// first pass alone is another pipeline.
+    #[test]
+    fn a_pipeline_of_passes_is_kept_by_all_its_passes() {
+        let Some(mut t) = title() else { return };
+        let l = linked(16, false, 128, true);
+        let passes: Vec<&HostShader> = l.passes.iter().map(|p| &**p).collect();
+        let ps = l.pixel.as_deref().unwrap();
+        let state = Graphics::guess_base().for_draw(vec![Format::Rgba32Float], None, vec![], &[], false);
+        let mut made = |t: &mut Title<Metal>, passes: &[&HostShader]| match t.render_pipe_passes(passes[0], &passes[1..], Some(ps), &state, "passes") {
+            Pipe::Render(pso, _) => pso.mesh_passes(),
+            _ => panic!("{:?}", t.shaders),
+        };
+        assert_eq!(made(&mut t, &passes), 4);
+        assert_eq!((t.shaders.pipelines, t.shaders.cached), (1, 0));
+        assert_eq!(made(&mut t, &passes), 4);
+        assert_eq!((t.shaders.pipelines, t.shaders.cached), (1, 1));
+        assert_eq!(made(&mut t, &passes[..1]), 1);
+        assert_eq!((t.shaders.pipelines, t.shaders.cached), (2, 1));
     }
 }

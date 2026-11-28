@@ -231,7 +231,8 @@ pub fn run(
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     let bytes = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let hash = blake3::hash(&bytes).to_hex().to_string();
-    match victory_game::identify(&hash) {
+    let known = victory_game::identify(&hash);
+    match known {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
@@ -242,6 +243,45 @@ pub fn run(
         image.base(),
         image.info().image_base
     );
+    // NativeImage is writable until bind() finalizes it. Nothing has run yet.
+    if execute {
+        use victory_loader::resolution::{Patched, Site};
+        if std::env::var_os("VICTORY_NO_HANG_WATCHDOG").is_none_or(|v| v != "0") {
+            match known.map(|b| b.hang_watchdog).filter(|p| !p.is_empty()) {
+                Some(patches) => {
+                    for p in patches {
+                        let site = Site {
+                            at: p.rva as usize,
+                            what: "hang watchdog",
+                            bytes: p.original,
+                        };
+                        // SAFETY: the image is mapped, writable, and not yet executing.
+                        let result = unsafe {
+                            victory_loader::resolution::write(
+                                image.base(),
+                                image.info().size_of_image as usize,
+                                &site,
+                                p.replacement,
+                            )
+                        };
+                        match result {
+                            Patched::Done => println!("hang watchdog  off at +{:#x}", p.rva),
+                            other => println!("hang watchdog  left on at +{:#x}: {other:?}", p.rva),
+                        }
+                    }
+                }
+                None => println!("hang watchdog  left on: unknown build"),
+            }
+        }
+        // SAFETY: before bind/finalize, TLS callbacks, DllMain and the title entry point.
+        unsafe {
+            victory_loader::resolution::apply_asked(
+                image.base(),
+                image.info().size_of_image as usize,
+            );
+        }
+    }
+
     if let Some(tls) = image.tls() {
         teb::register_tls(tls);
     }
@@ -419,6 +459,8 @@ fn connect_gpu() {
         victory_gpu::native::pool_observer(),
     ))));
     victory_gpu::native::set_event_hook(victory_hle::posix::set_event);
+    // A released pool's mapping stays until the GPU work submitted before has finished.
+    victory_gpu::native::set_pool_release_hook(victory_hle::modules::xmem_physical::let_go_of_pool);
 }
 
 /// `victory_gpu`'s pool observer behind the runtime's (victory-gpu does not know victory-hle).
@@ -445,6 +487,9 @@ impl Observer for PoolFeed {
     }
     fn unmapped(&self, at: usize, len: usize) {
         self.0.unmapped(at, len);
+    }
+    fn holds_released_pools(&self) -> bool {
+        true
     }
 }
 

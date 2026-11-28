@@ -13,6 +13,8 @@ mod run;
 mod shader;
 #[cfg(windows)]
 mod translate;
+#[cfg(not(windows))]
+mod translate_native;
 #[cfg(target_os = "macos")]
 mod warm;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -99,7 +101,7 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
+        /// Worker threads (native default: 4; Windows: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
         /// Only translate into the shader cache `run` reads (the warm-up):
@@ -107,6 +109,19 @@ enum Command {
         /// (with `--pipelines`, then the shader pack's pipelines).
         #[arg(long, conflicts_with_all = ["validate", "list"])]
         cache: bool,
+        /// Native host: link the mesh + pixel pairs listed in this file (one `mesh pixel` pair
+        /// of 16-digit container hashes a line, `-` for no pixel stage) from the containers in
+        /// the given folder, and print each mesh program's Metal output footprint and how it
+        /// was made to fit. `VICTORY_MESH_PAIRS_OUT=<dir>` also writes the linked DXIL.
+        #[arg(long, conflicts_with_all = ["validate", "pipelines", "cache"])]
+        mesh_pairs: Option<PathBuf>,
+        /// Native host: make the host pipelines of the shader sets listed in this file from the
+        /// containers in the given folder, without the title. A line is a set as the run's log
+        /// names it (`vertex <hash> pixel <hash>`, `vertex <hash>` or `compute <hash>`), with
+        /// `rect` after it when the set draws rectangle lists. The input layout and the targets
+        /// are stand-ins (see `victory_gpu::native::offline`).
+        #[arg(long, conflicts_with_all = ["validate", "pipelines", "cache", "mesh_pairs"])]
+        sets: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -252,8 +267,8 @@ fn main() -> Result<()> {
             }
             #[cfg(not(any(windows, target_os = "macos")))]
             {
-                let _ = (paths, jobs, pipelines);
-                anyhow::bail!("translate needs a Windows host for now")
+                anyhow::ensure!(!pipelines, "pipeline warm-up needs a Windows host");
+                translate_native::run(paths, false, jobs, true)
             }
         }
         Command::Translate {
@@ -263,17 +278,27 @@ fn main() -> Result<()> {
             list,
             jobs,
             cache: false,
+            mesh_pairs,
+            sets,
         } => {
             #[cfg(windows)]
             {
+                anyhow::ensure!(mesh_pairs.is_none() && sets.is_none(), "--mesh-pairs and --sets are for the native host");
                 translate::run(paths, validate, pipelines, list, jobs)
             }
-            // Translation checks shaders with the Windows DXC host, which
-            // other hosts do not have yet.
             #[cfg(not(windows))]
             {
-                let _ = (paths, validate, pipelines, list, jobs);
-                anyhow::bail!("translate needs a Windows host for now")
+                if let Some(pairs) = mesh_pairs {
+                    return translate_native::mesh_pairs(&pairs, paths);
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(sets) = sets {
+                    return translate_native::sets(&sets, paths);
+                }
+                #[cfg(not(target_os = "macos"))]
+                anyhow::ensure!(sets.is_none(), "--sets needs Metal");
+                anyhow::ensure!(!validate && !pipelines, "DXIL validation and pipeline checks need a Windows host");
+                translate_native::run(paths, list, jobs, false)
             }
         }
         Command::Run {

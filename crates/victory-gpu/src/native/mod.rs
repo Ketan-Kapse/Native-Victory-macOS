@@ -34,15 +34,20 @@ pub mod console_state;
 pub(crate) mod descriptor_trace;
 pub mod descriptors;
 pub mod freed;
+mod entries;
 #[cfg(target_os = "macos")]
 pub(crate) mod glue;
 pub mod host;
 pub mod list;
 pub mod memory;
+pub use memory::set_pool_release_hook;
+#[cfg(target_os = "macos")]
+pub mod offline;
 pub mod shaders;
 pub mod state;
 pub mod textures;
 pub mod title;
+pub(crate) mod twin;
 
 #[cfg(target_os = "macos")]
 pub type Host = host::NativeHost<victory_metal::metal::Metal>;
@@ -81,9 +86,58 @@ pub fn safe_read(at: *const u8, out: &mut [u8]) -> bool {
         };
         r == 0 && got == out.len() as u64
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        crate::host::read_into(at, out)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (at, out);
+        false
+    }
+}
+
+/// Whether all of `[at, at + len)` is mapped readable in this process now (one kernel query a
+/// region; nothing is read). `false` where the host cannot ask.
+pub fn readable(at: u64, len: u64) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            static mach_task_self_: u32;
+            fn mach_vm_region(
+                task: u32,
+                address: *mut u64,
+                size: *mut u64,
+                flavor: i32,
+                info: *mut i32,
+                count: *mut u32,
+                object_name: *mut u32,
+            ) -> i32;
+        }
+        /// `VM_REGION_BASIC_INFO_64` and its count of 32-bit words; `VM_PROT_READ`.
+        const BASIC_INFO_64: i32 = 9;
+        const BASIC_INFO_COUNT_64: u32 = 9;
+        const PROT_READ: i32 = 1;
+        let Some(end) = at.checked_add(len) else { return false };
+        let mut next = at;
+        while next < end {
+            let (mut address, mut size, mut info, mut count, mut name) = (next, 0u64, [0i32; 16], BASIC_INFO_COUNT_64, 0u32);
+            // SAFETY: out-parameters of the sizes the call writes; the kernel validates the address.
+            let r = unsafe {
+                mach_vm_region(mach_task_self_, &mut address, &mut size, BASIC_INFO_64, info.as_mut_ptr(), &mut count, &mut name)
+            };
+            // The region at or after `next`: a later start is a hole. `info[0]` is `protection`.
+            if r != 0 || address > next || info[0] & PROT_READ == 0 || size == 0 {
+                return false;
+            }
+            let Some(region_end) = address.checked_add(size) else { return true };
+            next = region_end;
+        }
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (at, len);
         false
     }
 }

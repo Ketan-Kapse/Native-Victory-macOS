@@ -67,7 +67,7 @@ pub(super) fn retry(
     if let Some((offset, what)) = split_branch(&q, &st, &res.waterfall.reads) {
         return Err(ShaderError::Unsupported { offset, what });
     }
-    emit_fast(c, native, &q, &st, io, res, options)
+    emit_fast(c, native, &q, &st, io, res, options, None, super::MeshFit::default())
 }
 
 /// The offset of a branch whose condition is not a uniform (SCC) value alone.
@@ -134,6 +134,9 @@ pub(crate) fn split_branch(
                         _ if scalar => from_reads(&bad),
                         "v_readfirstlane_b32" if waterfall.contains(&w) => Some((offset, WATERFALL_SOURCE)),
                         "v_readfirstlane_b32" => None,
+                        // A malformed/vector selector cannot elect a console-wide scalar.
+                        "v_readlane_b32" if matches!(&inst.fields, Fields::Valu(v)
+                            if matches!(v.src.get(1), Some(gfx10::Operand::Vector { .. }))) => Some((offset, LANE_SOURCE)),
                         // The lane is a scalar; the value comes through the exchange.
                         "v_readlane_b32" => from_reads(&bad),
                         _ => Some((offset, LANE_SOURCE)),

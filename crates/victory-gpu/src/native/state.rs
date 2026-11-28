@@ -6,6 +6,7 @@
 
 use super::descriptors::format;
 use victory_backend::resources::*;
+use victory_shader::emit::RECT_CORNER_SHIFT;
 
 /// A `CB_BLEND<n>_CONTROL` register as the D3D12 description of a target (all channels written);
 /// `None` for a factor D3D12 has no value for (`BOTH_SRC_ALPHA`, `BOTH_INV_SRC_ALPHA`).
@@ -430,12 +431,21 @@ impl Graphics {
         &self,
         reads: &[(String, u32)],
     ) -> Option<(Vec<VertexAttr>, Vec<VertexStream>)> {
+        // A described pipeline's rectangle strip reads each element for three corners
+        // ([`rect_strip`]): the element of the layout, a vertex further along for each corner.
+        let strip = self.guess.is_none() && rect_strip(reads);
         let mut attributes = Vec::new();
+        let mut corners = Vec::new();
         for (name, index) in reads {
+            let (corner, index) = if strip {
+                (index >> RECT_CORNER_SHIFT, index & ((1 << RECT_CORNER_SHIFT) - 1))
+            } else {
+                (0, *index)
+            };
             let e = self
                 .inputs
                 .iter()
-                .find(|e| e.name.eq_ignore_ascii_case(name) && e.index == *index)?;
+                .find(|e| e.name.eq_ignore_ascii_case(name) && e.index == index)?;
             let format = vertex_format(e.format)
                 .or_else(|| self.guess.as_ref().and_then(|_| guessed_vertex_format(&e.name).map(|(_, f)| f)))?;
             attributes.push(VertexAttr {
@@ -443,6 +453,7 @@ impl Graphics {
                 slot: e.slot as usize,
                 offset: e.offset as usize,
             });
+            corners.push(corner as usize);
         }
         let mut streams: Vec<VertexStream> = Vec::new();
         for e in &self.inputs {
@@ -475,6 +486,16 @@ impl Graphics {
                 };
             }
         }
+        if strip {
+            // One instance is a rectangle: three vertices of the stream.
+            for (a, corner) in attributes.iter_mut().zip(corners) {
+                a.offset += corner * streams.iter().find(|s| s.slot == a.slot)?.stride;
+            }
+            for s in &mut streams {
+                s.stride *= 3;
+                s.per_instance = true;
+            }
+        }
         Some((attributes, streams))
     }
 
@@ -498,6 +519,15 @@ impl Graphics {
                 }
             })
             .collect()
+    }
+
+    /// Debugging (`VICTORY_DEBUG_DEPTH_ALWAYS`): the depth test always passes, and writes the
+    /// fragments' depth if `write` (the depth target then shows where the draws rasterised and
+    /// the very depth they had).
+    pub fn debug_depth_always(&mut self, write: bool) {
+        self.depth_enable = true;
+        self.depth_func = 8;
+        self.depth_write = write;
     }
 
     pub fn depth_test(&self) -> Option<(bool, Compare)> {
@@ -718,6 +748,15 @@ pub fn topology(d3d: u32) -> Option<Topology> {
         5 => Topology::TriangleStrip,
         _ => return None,
     })
+}
+
+/// Whether a described vertex shader's inputs (`reads`, as [`vertex_inputs`] gives them) are those
+/// of a rectangle list drawn as strips: its stage-in attributes declared for the three corners of
+/// a rectangle (`victory_shader::emit::Options::rect_list`), which the host draws as a guessed
+/// pipeline's rectangles, a four-vertex strip instance a rectangle. Not for guessed pipelines,
+/// whose element indices have the corner in the same bits whatever they draw.
+pub fn rect_strip(reads: &[(String, u32)]) -> bool {
+    reads.iter().any(|r| r.1 >> RECT_CORNER_SHIFT != 0)
 }
 
 /// The semantics a vertex shader reads, in its input signature's order (system values, which the
@@ -1034,6 +1073,18 @@ mod tests {
         assert!(g.vertex_layout(&[("NORMAL".to_owned(), 0)]).is_none());
     }
 
+    /// `VICTORY_DEBUG_DEPTH_ALWAYS`: the test passes always, with or without the write, whatever
+    /// the pipeline said (here a test that is off).
+    #[test]
+    fn the_debug_depth_state_always_passes() {
+        let mut g = Graphics { depth_enable: false, depth_write: true, depth_func: 3, ..Graphics::default() };
+        assert_eq!(g.depth_test(), None);
+        g.debug_depth_always(false);
+        assert_eq!(g.depth_test(), Some((false, Compare::Always)));
+        g.debug_depth_always(true);
+        assert_eq!(g.depth_test(), Some((true, Compare::Always)));
+    }
+
     #[test]
     fn a_rectangle_list_reads_three_corners_per_instance() {
         // One float3 at slot 0 offset 0 of a 24-byte vertex, read at corners 0 to 2.
@@ -1042,6 +1093,49 @@ mod tests {
         let (attrs, streams) = g.vertex_layout(&reads).unwrap();
         assert_eq!(attrs.iter().map(|a| a.offset).collect::<Vec<_>>(), [0, 24, 48]);
         assert_eq!((streams[0].stride, streams[0].per_instance), (72, true));
+    }
+
+    /// A described layout read by a rectangle variant (each element for three corners, the
+    /// corner in the semantic index's top bits): corner n is n vertices on in the same stream,
+    /// and an instance, a rectangle, is three vertices. Read once, the layout is the title's.
+    #[test]
+    fn a_described_rectangle_list_reads_three_corners_per_instance() {
+        let names = [c"POSITION", c"TEXCOORD"];
+        let mut elements = Vec::new();
+        // POSITION float3 at 0, TEXCOORD float2 at 12 (semantic index 1): 20 bytes a vertex.
+        for (n, index, format, offset) in [(0, 0u32, 6u32, 0u32), (1, 1, 16, 12)] {
+            let mut e = [0u8; 32];
+            e[..8].copy_from_slice(&(names[n].as_ptr() as u64).to_le_bytes());
+            for (k, w) in [index, format, 0, offset, 0, 0].into_iter().enumerate() {
+                e[8 + 4 * k..12 + 4 * k].copy_from_slice(&u32::to_le_bytes(w));
+            }
+            elements.extend(e);
+        }
+        let mut s = 12u32.to_le_bytes().to_vec();
+        s.extend([0; 4]);
+        s.extend((elements.as_ptr() as u64).to_le_bytes());
+        s.extend(2u32.to_le_bytes());
+        s.extend([0; 4]);
+        let mut g = Graphics::default();
+        // SAFETY: a whole input layout subobject over live elements and names.
+        unsafe { g.read(12, s.as_ptr()) };
+        let once = [("POSITION".to_owned(), 0), ("TEXCOORD".to_owned(), 1)];
+        assert!(!rect_strip(&once));
+        let (attrs, streams) = g.vertex_layout(&once).unwrap();
+        assert_eq!(attrs.iter().map(|a| a.offset).collect::<Vec<_>>(), [0, 12]);
+        assert_eq!((streams[0].stride, streams[0].per_instance), (20, false));
+        let corner = |c: u32| c << RECT_CORNER_SHIFT;
+        let reads = [
+            ("POSITION".to_owned(), 0), ("TEXCOORD".to_owned(), 1),
+            ("POSITION".to_owned(), corner(1)), ("POSITION".to_owned(), corner(2)),
+            ("TEXCOORD".to_owned(), corner(1) | 1), ("TEXCOORD".to_owned(), corner(2) | 1),
+        ];
+        assert!(rect_strip(&reads));
+        let (attrs, streams) = g.vertex_layout(&reads).unwrap();
+        assert_eq!(attrs.iter().map(|a| a.offset).collect::<Vec<_>>(), [0, 12, 20, 40, 32, 52]);
+        assert_eq!((streams.len(), streams[0].stride, streams[0].per_instance), (1, 60, true));
+        // An element the layout lacks is still refused.
+        assert!(g.vertex_layout(&[("NORMAL".to_owned(), corner(1))]).is_none());
     }
 
     #[test]

@@ -180,6 +180,20 @@ pub struct NativeProgram {
 }
 
 impl NativeProgram {
+    /// Root parameters spilled past the hardware user SGPRs into a table starting at
+    /// user-data index 16. This is the arrangement used by this title's BVH builder
+    /// (the 7900XTX fork's `spill::is_spilled` detector), not a general RT-stage tag.
+    pub fn is_spilled(&self) -> bool {
+        let StageIo::Cs(cs) = &self.io else { return false };
+        if self.stage != HwStage::Cs || cs.user_sgprs() < 2 {
+            return false;
+        }
+        self.layout.iter()
+            .filter(|e| e.sgprs > 0 && e.user_data >= cs.user_sgprs())
+            .map(|e| e.user_data)
+            .min() == Some(16)
+    }
+
     /// The code with each render target's export patched for its full
     /// 32-bit format, so exports carry the shader's values unconverted (as
     /// the console does at pipeline creation for that format).
@@ -971,22 +985,23 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
     data.get(start..start.checked_add(usize::try_from(len).ok()?)?)
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// Containers of our own programs, as the title's shader compiler would have packed them, for
+/// the tests of this crate and of the hosts. No title code or data.
+pub mod synthetic {
     use super::*;
+    use crate::dxbc::{self, FourCC};
+    use crate::emit::{TestSigElement, test_signature};
 
-    const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-    const PS_CODE: [u8; 4] = [9, 10, 11, 12];
-    const VGPRS: u32 = 28;
+    pub(crate) const VGPRS: u32 = 28;
 
-    fn slot(stage: HwStage) -> usize {
+    pub(crate) fn slot(stage: HwStage) -> usize {
         SLOTS.iter().find(|s| s.0 == stage).unwrap().1
     }
 
     /// Stage data: no semantics, and every export patch absent.
-    const STAGE_DATA: usize = PS_PATCHES + MRTS * PATCH_BYTES;
+    pub(crate) const STAGE_DATA: usize = PS_PATCHES + MRTS * PATCH_BYTES;
 
-    fn empty_stage_data() -> Vec<u8> {
+    pub(crate) fn empty_stage_data() -> Vec<u8> {
         let mut data = vec![0; STAGE_DATA];
         for mrt in 0..MRTS {
             let at = PS_PATCHES + mrt * PATCH_BYTES;
@@ -996,14 +1011,14 @@ pub(crate) mod tests {
     }
 
     /// Where a one-program blob's stage data starts.
-    fn stage_data_at(blob: &[u8], stage: HwStage) -> usize {
+    pub(crate) fn stage_data_at(blob: &[u8], stage: HwStage) -> usize {
         FSSM_HEADER
             + u64_at(blob, FSSM_HEADER + slot(stage)).unwrap() as usize
             + RECORD_SIZE as usize
     }
 
     /// FSSM blob with `programs` as (stage, code) pairs.
-    fn fssm(programs: &[(HwStage, &[u8])]) -> Vec<u8> {
+    pub(crate) fn fssm(programs: &[(HwStage, &[u8])]) -> Vec<u8> {
         let mut payload = GRAPHICS_SLOT_COUNT.to_le_bytes().to_vec();
         payload.resize(slot(HwStage::Cs) + 8, 0);
         for (_, at) in SLOTS {
@@ -1031,7 +1046,7 @@ pub(crate) mod tests {
         out
     }
 
-    fn xbch(unpacked: &[u8]) -> Vec<u8> {
+    pub(crate) fn xbch(unpacked: &[u8]) -> Vec<u8> {
         let stream = miniz_oxide::deflate::compress_to_vec_zlib(unpacked, 6);
         let mut out = b"XBCH".to_vec();
         out.extend_from_slice(&XBCH_VERSION.to_le_bytes());
@@ -1042,7 +1057,7 @@ pub(crate) mod tests {
     }
 
     /// `DXIL` part data: program header, XDAT index, then the blobs.
-    fn part(blobs: &[(u32, &[u8])]) -> Vec<u8> {
+    pub(crate) fn part(blobs: &[(u32, &[u8])]) -> Vec<u8> {
         let mut out = vec![0u8; XDAT_OFFSET];
         out.extend_from_slice(b"XDAT");
         out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
@@ -1059,6 +1074,375 @@ pub(crate) mod tests {
         }
         out
     }
+
+    /// A signature element of a synthetic container: `cols` channels from `col` of the
+    /// console's parameter row `row`.
+    #[derive(Clone, Debug)]
+    pub struct Element {
+        pub name: &'static str,
+        pub index: u32,
+        /// DXIL semantic kind: 0 arbitrary, 3 position, 16 target.
+        pub kind: u8,
+        pub row: u32,
+        pub col: u8,
+        pub cols: u8,
+    }
+
+    fn signature(elements: &[Element], input: bool) -> Vec<u8> {
+        let elements: Vec<TestSigElement> = elements
+            .iter()
+            .map(|e| TestSigElement {
+                name: e.name.into(),
+                index: e.index,
+                kind: e.kind,
+                row: Some(e.row),
+                col: e.col,
+                cols: e.cols,
+                comp: 9,
+                interp: 0,
+                usage: 15,
+                half: false,
+            })
+            .collect();
+        test_signature(&elements, input)
+    }
+
+    fn words(code: &[u32]) -> Vec<u8> {
+        code.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// A mesh program's container: `code`, the stage data naming parameter rows `0..params`
+    /// (`exp param<n>` is row n), the thread-group size and output maxima, and `outputs` as its
+    /// output signature.
+    pub fn mesh(code: &[u32], params: u8, threads: u16, max_vertices: u16, max_primitives: u16, outputs: &[Element]) -> Vec<u8> {
+        let mut blob = fssm(&[(HwStage::Ms, &words(code))]);
+        let at = stage_data_at(&blob, HwStage::Ms);
+        for n in 0..params {
+            // Usage 6 (a generic parameter), its row, its `exp param` number.
+            blob[at + VS_OUTPUTS + 6 * usize::from(n)..][..3].copy_from_slice(&[6, n, n]);
+        }
+        blob[at + VS_OUTPUT_COUNT..][..4].copy_from_slice(&u32::from(params).to_le_bytes());
+        let info = &mut blob[at + MS_INFO..][..8];
+        info[0..2].copy_from_slice(&threads.to_le_bytes());
+        info[2..4].copy_from_slice(&max_vertices.to_le_bytes());
+        info[4..6].copy_from_slice(&max_primitives.to_le_bytes());
+        // Triangles.
+        info[7] = 2;
+        dxbc::build(&[
+            (FourCC::DXIL, &part(&[(KIND_NATIVE, &xbch(&blob))])),
+            (FourCC::OSG1, &signature(outputs, false)),
+        ])
+    }
+
+    /// `op dst, src0, vsrc1` of the two-operand vector encoding; `src0` is an operand code.
+    fn vop2(op: u32, dst: u32, src0: u32, vsrc1: u32) -> u32 {
+        op << 25 | dst << 17 | vsrc1 << 9 | src0
+    }
+
+    /// Operand codes: a vector register, and a small unsigned constant.
+    const fn v(n: u32) -> u32 {
+        256 + n
+    }
+    const fn k(n: u32) -> u32 {
+        128 + n
+    }
+
+    const V_CNDMASK: u32 = 0x01;
+    const V_LSHRREV: u32 = 0x16;
+    const V_LSHLREV: u32 = 0x1a;
+    const V_AND: u32 = 0x1b;
+    const V_OR: u32 = 0x1c;
+    const V_MADMK_F32: u32 = 0x20;
+    const V_ADD_U32: u32 = 0x25;
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// The triangles [`grid_mesh_code`] draws: 56.
+    pub const GRID_TRIANGLES: u32 = 56;
+
+    /// The corners (vertex numbers) of triangle `n` of [`grid_mesh_code`].
+    pub fn grid_triangle(n: u32) -> [u32; 3] {
+        let cell = n >> 1;
+        let first = (cell >> 2) * 8 + (cell & 3);
+        let places = if n & 1 == 0 { [first, first + 1, first + 8] } else { [first + 1, first + 9, first + 8] };
+        places.map(|place| (place * 17) & 63)
+    }
+
+    /// A mesh program of one 64-lane wave, for programs of many outputs.
+    ///
+    /// Lane n exports vertex n: it stands at place `49 n mod 64` of an 8 x 8 grid of points over
+    /// the target (so the vertices of a triangle have numbers far apart), and channel c of
+    /// parameter p is `n (1 + 4 p + c) / 256 + 0.25`. Lanes 0 to 55 export a primitive each
+    /// ([`grid_triangle`]): the two triangles of the grid's cells, four cells a row, seven rows,
+    /// which overlap nowhere, so the picture does not depend on the order they are drawn in.
+    pub fn grid_mesh_code(params: u8) -> Vec<u32> {
+        let cvt_f32_u32 = |dst: u32, src: u32| 0x7E00_0C00 | dst << 17 | v(src);
+        let mut code = vec![
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xD765_0001, 0x0201_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0xD766_0001, 0x0202_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1: the lane
+            vop2(V_LSHLREV, 2, k(4), 1),
+            vop2(V_LSHLREV, 3, k(5), 1),
+            vop2(V_ADD_U32, 2, v(2), 1),
+            vop2(V_ADD_U32, 2, v(2), 3),
+            vop2(V_AND, 2, k(63), 2), // v2: the place, 49 n mod 64
+            vop2(V_AND, 3, k(7), 2),
+            vop2(V_LSHRREV, 4, k(3), 2),
+            cvt_f32_u32(3, 3),
+            cvt_f32_u32(4, 4),
+            0x7E14_02F3, // v_mov_b32 v10, -1.0
+            vop2(V_MADMK_F32, 3, v(3), 10), (2.0f32 / 7.0).to_bits(), // v3: x = column * 2/7 - 1
+            vop2(V_MADMK_F32, 4, v(4), 10), (2.0f32 / 7.0).to_bits(), // v4: y = row * 2/7 - 1
+            0x7E0C_02F2, // v_mov_b32 v6, 1.0
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            cvt_f32_u32(8, 1),
+            0x7E12_02FF, 0.25f32.to_bits(), // v_mov_b32 v9, 0.25
+        ];
+        for p in 0..u32::from(params) {
+            for c in 0..4 {
+                let slope = (1 + 4 * p + c) as f32 / 256.0;
+                code.extend([vop2(V_MADMK_F32, 20 + c, v(8), 9), slope.to_bits()]);
+            }
+            // exp param<p> v20, v21, v22, v23
+            code.extend([0xF800_020F | p << 4, 0x1716_1514]);
+        }
+        code.extend([0xF800_08CF, 0x0607_0403]); // exp pos0 v3, v4, v7, v6 done
+        // The lanes below 56 export a primitive.
+        code.push(0x7C00_0000 | 0xD4 << 17 | 1 << 9 | k(GRID_TRIANGLES)); // v_cmpx_gt_u32 56, v1
+        code.extend([
+            vop2(V_LSHRREV, 11, k(1), 1), // v11: the cell
+            vop2(V_AND, 12, k(3), 11),
+            vop2(V_LSHRREV, 13, k(2), 11),
+            vop2(V_LSHLREV, 13, k(3), 13),
+            vop2(V_ADD_U32, 14, v(13), 12), // v14: the cell's first place
+            vop2(V_AND, 15, k(1), 1),
+            0x7C00_0000 | 0xC2 << 17 | 15 << 9 | k(1), // v_cmp_eq_u32 vcc, 1, v15: the cell's second triangle
+            vop2(V_ADD_U32, 16, k(1), 14),
+            vop2(V_ADD_U32, 17, k(9), 14),
+            vop2(V_ADD_U32, 18, k(8), 14), // v18: the third corner's place
+            vop2(V_CNDMASK, 19, v(14), 16), // v19: the first corner's place
+            vop2(V_CNDMASK, 24, v(16), 17), // v24: the second corner's place
+        ]);
+        // A place's vertex: 17 place mod 64 (17 * 49 = 13 * 64 + 1).
+        for place in [19, 24, 18] {
+            code.extend([
+                vop2(V_LSHLREV, 25, k(4), place),
+                vop2(V_ADD_U32, place, v(place), 25),
+                vop2(V_AND, place, k(63), place),
+            ]);
+        }
+        code.extend([
+            vop2(V_LSHLREV, 24, k(10), 24),
+            vop2(V_LSHLREV, 18, k(20), 18),
+            vop2(V_OR, 19, v(19), 24),
+            vop2(V_OR, 19, v(19), 18),
+            0xF800_0941, 19, // exp prim v19 done
+            S_ENDPGM,
+        ]);
+        code
+    }
+
+    /// A pixel program that reads every channel of parameters `0..params` and writes, to channel
+    /// c of its target, `((p0.c / 2 + p1.c) / 2 + p2.c) / 2 + ...`: every channel of every
+    /// parameter changes the colour, each by another weight.
+    pub fn weighted_pixel_code(params: u8) -> Vec<u32> {
+        let mut code: Vec<u32> = (4..8).map(|r| 0x7E00_0280 | r << 17).collect(); // v_mov_b32 v4..v7, 0
+        for p in 0..u32::from(params) {
+            for c in 0..4 {
+                code.extend([
+                    0xC808_0000 | p << 10 | c << 8, // v_interp_p1_f32 v2, v0, attr<p>.<c>
+                    0xC809_0001 | p << 10 | c << 8, // v_interp_p2_f32 v2, v1, attr<p>.<c>
+                    vop2(V_MADMK_F32, 4 + c, v(4 + c), 2), 0.5f32.to_bits(),
+                ]);
+            }
+        }
+        code.extend([0xF800_180F, 0x0706_0504, S_ENDPGM]); // exp mrt0 v4, v5, v6, v7 done vm
+        code
+    }
+
+    /// The outputs of a mesh program of `rows` parameter rows (and the inputs of its pixel
+    /// program, without the position): each row one `float4`, or with `split` a `float3` and a
+    /// `float` (as the title packs them), which Metal lays out with padding between them.
+    pub fn row_elements(rows: u8, split: bool, position: bool) -> Vec<Element> {
+        let rows = u32::from(rows);
+        let element = |index, row, col, cols| Element { name: "TEXCOORD", index, kind: 0, row, col, cols };
+        let mut elements: Vec<Element> = (0..rows)
+            .flat_map(|row| {
+                if split {
+                    vec![element(2 * row, row, 0, 3), element(2 * row + 1, row, 3, 1)]
+                } else {
+                    vec![element(row, row, 0, 4)]
+                }
+            })
+            .collect();
+        if position {
+            elements.push(Element { name: "SV_Position", index: 0, kind: 3, row: rows, col: 0, cols: 4 });
+        }
+        elements
+    }
+
+    /// [`grid_mesh_code`] and [`weighted_pixel_code`] of `rows` parameter rows as a mesh and a
+    /// pixel container ([`row_elements`]), the mesh program declaring `max_vertices` vertices
+    /// (it stores 64) in groups of 64 threads.
+    pub fn grid_pair(rows: u8, split: bool, max_vertices: u16) -> (Vec<u8>, Vec<u8>) {
+        (
+            mesh(&grid_mesh_code(rows), rows, 64, max_vertices, 64, &row_elements(rows, split, true)),
+            pixel(&weighted_pixel_code(rows), rows, &row_elements(rows, split, false)),
+        )
+    }
+
+    /// A pixel program's container: `code`, the stage data naming input rows `0..params`
+    /// (attribute n is row n, all four channels), perspective barycentrics in `v0` and `v1`,
+    /// `inputs` as its input signature and one float target.
+    pub fn pixel(code: &[u32], params: u8, inputs: &[Element]) -> Vec<u8> {
+        pixel_with(code, 0, params, inputs)
+    }
+
+    /// [`pixel`] of a program with `sgprs` root constants (root slot 0) in `s0` and up.
+    fn pixel_with(code: &[u32], sgprs: u32, params: u8, inputs: &[Element]) -> Vec<u8> {
+        let mut blob = fssm(&[(HwStage::Ps, &words(code))]);
+        if sgprs > 0 {
+            root_constants(&mut blob, HwStage::Ps, sgprs);
+        }
+        let at = stage_data_at(&blob, HwStage::Ps);
+        for n in 0..params {
+            // Usage 6, its row, all channels, its attribute number.
+            blob[at + PS_INPUTS + 8 * usize::from(n)..][..4].copy_from_slice(&[6, n, 0xF, n]);
+        }
+        blob[at + PS_INPUT_COUNT..][..4].copy_from_slice(&u32::from(params).to_le_bytes());
+        blob[at + PS_INPUT_ADDR..][..4].copy_from_slice(&2u32.to_le_bytes());
+        let target = Element { name: "SV_Target", index: 0, kind: 16, row: 0, col: 0, cols: 4 };
+        dxbc::build(&[
+            (FourCC::DXIL, &part(&[(KIND_NATIVE, &xbch(&blob))])),
+            (FourCC::ISG1, &signature(inputs, true)),
+            (FourCC::OSG1, &signature(&[target], false)),
+        ])
+    }
+
+    /// A described vertex program's container: `code`, the stage data naming the attributes
+    /// `inputs` (the fetch shader loads channel c of the n-th into `v<8 + 4 n + c>`) and
+    /// parameter rows `0..params` (`exp param<n>` is row n), with `inputs` and `outputs` as its
+    /// signatures.
+    pub fn vertex(code: &[u32], inputs: &[Element], params: u8, outputs: &[Element]) -> Vec<u8> {
+        vertex_with(code, 0, inputs, params, outputs)
+    }
+
+    /// [`vertex`] of a program with `sgprs` root constants (root slot 0) in `s0` and up.
+    fn vertex_with(code: &[u32], sgprs: u32, inputs: &[Element], params: u8, outputs: &[Element]) -> Vec<u8> {
+        let mut blob = fssm(&[(HwStage::Vs, &words(code))]);
+        if sgprs > 0 {
+            root_constants(&mut blob, HwStage::Vs, sgprs);
+        }
+        let at = stage_data_at(&blob, HwStage::Vs);
+        for (n, e) in inputs.iter().enumerate() {
+            // Usage 6, its row, all channels, its first register.
+            blob[at + VS_INPUTS + 5 * n..][..4].copy_from_slice(&[6, e.row as u8, 0xF, 8 + 4 * n as u8]);
+        }
+        blob[at + VS_INPUT_COUNT..][..4].copy_from_slice(&(inputs.len() as u32).to_le_bytes());
+        for n in 0..params {
+            blob[at + VS_OUTPUTS + 6 * usize::from(n)..][..3].copy_from_slice(&[6, n, n]);
+        }
+        blob[at + VS_OUTPUT_COUNT..][..4].copy_from_slice(&u32::from(params).to_le_bytes());
+        dxbc::build(&[
+            (FourCC::DXIL, &part(&[(KIND_NATIVE, &xbch(&blob))])),
+            (FourCC::ISG1, &signature(inputs, true)),
+            (FourCC::OSG1, &signature(outputs, false)),
+        ])
+    }
+
+    /// Gives the one program of `blob` (an FSSM blob holding a `stage` program) a root layout:
+    /// `sgprs` root constants of root slot 0 in `s0` and up.
+    fn root_constants(blob: &mut Vec<u8>, stage: HwStage, sgprs: u32) {
+        let record = FSSM_HEADER + u64_at(blob, FSSM_HEADER + slot(stage)).unwrap() as usize;
+        let table = (blob.len() - FSSM_HEADER) as u64;
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
+        blob[record + RECORD_COUNTS..][..4].copy_from_slice(&1u32.to_le_bytes());
+        // Root type 0 (constants), no table offset, the SGPRs, register 0, user data 0, slot 0.
+        for w in [0, 0, sgprs, 0, 0] {
+            blob.extend_from_slice(&w.to_le_bytes());
+        }
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+    }
+
+    /// A described vertex and pixel program that read title memory at an address they compute
+    /// from their root constants (the 64-bit address `a` in `s[0:1]` of either stage).
+    ///
+    /// The vertex program draws one triangle over the whole target ((-1, -1), (-1, 3), (3, -1)
+    /// by vertex ID: clockwise, the front of D3D12's default state) and exports as parameter 0's x the float at `a + 4 * vertex ID`. The pixel
+    /// program writes that as red, the dword at `a + 16` divided by 255 as green, 0 and 1.
+    pub fn memory_pair() -> (Vec<u8>, Vec<u8>) {
+        let vertex = [
+            0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+            0xD501_0001, 0x01A9_FEF3, 0x4040_0000, // v_cndmask_b32 v1, -1.0, 3.0, vcc
+            0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+            0xD501_0002, 0x01A9_FEF3, 0x4040_0000, // v_cndmask_b32 v2, -1.0, 3.0, vcc
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_02F2, // v_mov_b32 v4, 1.0
+            0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+            0xDC30_8000, 0x0600_0005, // global_load_dword v6, v5, s[0:1]
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF800_020F, 6 | 3 << 8 | 3 << 16 | 4 << 24, // exp param0 v6, v3, v3, v4
+            0xF800_08CF, 0x0403_0201, // exp pos0 v1, v2, v3, v4 done
+            S_ENDPGM,
+        ];
+        let pixel = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0x7E06_0290, // v_mov_b32 v3, 16
+            0xDC30_8000, 0x0400_0003, // global_load_dword v4, v3, s[0:1]
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x7E08_0D04, // v_cvt_f32_u32 v4, v4
+            0x1008_08FF, 0x3B80_8081, // v_mul_f32 v4, 1/255, v4
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E0C_02F2, // v_mov_b32 v6, 1.0
+            0xF800_180F, 0x0605_0402, // exp mrt0 v2, v4, v5, v6 done vm
+            S_ENDPGM,
+        ];
+        (
+            vertex_with(&vertex, 2, &[], 1, &row_elements(1, false, true)),
+            pixel_with(&pixel, 2, 1, &row_elements(1, false, false)),
+        )
+    }
+
+    /// A vertex program of two stage-in attributes, for rectangle lists: the position is
+    /// `POSITION.xy` (z 0.5, w 1), and parameter 0 is `TEXCOORD.xy`, then 1.0 for console vertex
+    /// IDs of 3 and up (the rectangles after the first of a draw) and 0.0 below, then 1.0.
+    pub fn rect_vertex() -> Vec<u8> {
+        let code = [
+            0xD4C1_0000, k(2) | v(0) << 9, // v_cmp_lt_u32 s[0:1], 2, v0
+            0xD501_0000, k(0) | 242 << 9, // v_cndmask_b32 v0, 0, 1.0, s[0:1]
+            0x7E14_02F0, // v_mov_b32 v10, 0.5
+            0x7E16_02F2, // v_mov_b32 v11, 1.0
+            0xF800_020F, 12 | 13 << 8 | 11 << 24, // exp param0 v12, v13, v0, v11
+            0xF800_08CF, 8 | 9 << 8 | 10 << 16 | 11 << 24, // exp pos0 v8, v9, v10, v11 done
+            S_ENDPGM,
+        ];
+        let attribute = |name, row| Element { name, index: 0, kind: 0, row, col: 0, cols: 4 };
+        let outputs = row_elements(1, false, true);
+        vertex(&code, &[attribute("POSITION", 0), attribute("TEXCOORD", 1)], 1, &outputs)
+    }
+
+    /// The pixel program of [`rect_vertex`]: parameter 0's x, y and z as red, green and blue.
+    pub fn rect_pixel() -> Vec<u8> {
+        let mut code = Vec::new();
+        for c in 0..3 {
+            code.extend([
+                0xC800_0000 | (2 + c) << 18 | c << 8, // v_interp_p1_f32 v<2 + c>, v0, attr0.<c>
+                0xC801_0001 | (2 + c) << 18 | c << 8, // v_interp_p2_f32 v<2 + c>, v1, attr0.<c>
+            ]);
+        }
+        code.extend([0x7E0A_02F2, 0xF800_180F, 0x0504_0302, S_ENDPGM]); // v5 = 1.0; exp mrt0 done vm
+        pixel(&code, 1, &row_elements(1, false, false))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    const PS_CODE: [u8; 4] = [9, 10, 11, 12];
+    use super::synthetic::{fssm, part, slot, stage_data_at, xbch};
 
     #[test]
     fn finds_graphics_programs() {
@@ -1241,6 +1625,96 @@ pub(crate) mod tests {
         );
     }
 
+    /// Synthetic FSSM register images, linked through exactly the native host's translator.
+    #[test]
+    fn mesh_stage_registers_and_pixel_pair_link_before_output_measurement() {
+        use crate::dxbc::{self, FourCC};
+        use crate::emit::{self, TestSigElement as SigElement, test_signature as signature};
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>();
+        let ms_code = words(&[
+            0x7E00_02F2, // v_mov_b32 v0, 1.0
+            0xF800_020F,
+            0, // exp param0 v0, v0, v0, v0
+            0xF800_021F,
+            0, // exp param1 v0, v0, v0, v0
+            0xF800_0941,
+            0, // exp prim v0, off, off, off done
+            0xF800_08CF,
+            0, // exp pos0 v0, v0, v0, v0 done
+            0xBF81_0000,
+        ]);
+        let mut ms_blob = fssm(&[(HwStage::Ms, &ms_code)]);
+        let ms_at = stage_data_at(&ms_blob, HwStage::Ms);
+        ms_blob[ms_at + VS_OUTPUTS..][..12].copy_from_slice(&[6, 0, 0, 0, 0, 0, 6, 1, 1, 0, 0, 0]);
+        ms_blob[ms_at + VS_OUTPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+        ms_blob[ms_at + MS_INFO..][..8].copy_from_slice(&[128, 0, 128, 0, 64, 0, 0, 2]);
+        let ps_code = words(&[
+            0xC808_0000,
+            0xC809_0001,
+            0xF800_180F,
+            0x0202_0202,
+            0xBF81_0000,
+        ]);
+        let mut ps_blob = fssm(&[(HwStage::Ps, &ps_code)]);
+        let ps_at = stage_data_at(&ps_blob, HwStage::Ps);
+        ps_blob[ps_at + PS_INPUTS..][..8].copy_from_slice(&[6, 0, 1, 0, 0, 0, 0, 0]);
+        ps_blob[ps_at + PS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        ps_blob[ps_at + PS_INPUT_ADDR..][..4].copy_from_slice(&2u32.to_le_bytes());
+        let element = |name: &str, index, kind, row, cols| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            row: Some(row),
+            col: 0,
+            cols,
+            comp: 9,
+            interp: 0,
+            usage: 15,
+            half: false,
+        };
+        let ms = dxbc::build(&[
+            (FourCC::DXIL, &part(&[(KIND_NATIVE, &xbch(&ms_blob))])),
+            (
+                FourCC::OSG1,
+                &signature(
+                    &[
+                        element("TEXCOORD", 0, 0, 0, 4),
+                        element("TEXCOORD", 1, 0, 1, 4),
+                        element("SV_Position", 0, 3, 2, 4),
+                    ],
+                    false,
+                ),
+            ),
+        ]);
+        let ps = dxbc::build(&[
+            (FourCC::DXIL, &part(&[(KIND_NATIVE, &xbch(&ps_blob))])),
+            (
+                FourCC::ISG1,
+                &signature(&[element("TEXCOORD", 0, 0, 0, 4)], true),
+            ),
+            (
+                FourCC::OSG1,
+                &signature(&[element("SV_Target", 0, 16, 0, 4)], false),
+            ),
+        ]);
+        let options = emit::Options {
+            wave32_host: true,
+            zero_copy_memory: true,
+            ..Default::default()
+        };
+        let full = emit::translate_with(&ms, options).unwrap();
+        let (linked, pixel) = emit::translate_linked(&ms, Some(&ps), options).unwrap();
+        assert_eq!(linked.stage, HwStage::Ms);
+        assert_eq!(pixel.unwrap().stage, HwStage::Ps);
+        assert!(
+            emit::metal_mesh_bytes(&linked.dxil).unwrap() < emit::metal_mesh_bytes(&full.dxil).unwrap()
+        );
+        let (depth_only, pixel) = emit::translate_linked(&ms, None, options).unwrap();
+        assert!(pixel.is_none());
+        assert_eq!(emit::metal_mesh_bytes(&depth_only.dxil), Some(128 * 16));
+        assert!(emit::translate_linked(&ps, Some(&ms), options).is_err());
+    }
+
     #[test]
     fn mesh_stage_io_ignores_unused_vs_input_count() {
         let mut blob = fssm(&[(HwStage::Ms, &VS_CODE)]);
@@ -1249,6 +1723,43 @@ pub(crate) mod tests {
         blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
         let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
         assert!(matches!(p.io, StageIo::Ms(_)));
+    }
+
+    #[test]
+    fn spilled_user_data_detects_only_the_builder_layout() {
+        let mut p = NativeProgram {
+            stage: HwStage::Cs, wave64: false, vgprs: 1,
+            layout: vec![RootParam {
+                root: RootType::Constants, table_offset_dwords: 0, sgprs: 2,
+                base_register: 0, user_data: 16, slot: 0,
+            }],
+            used: vec![], io: StageIo::Cs(ComputeIo { rsrc2: 2 << 1, threads: [1; 3] }),
+            code: vec![],
+        };
+        assert!(p.is_spilled());
+        for registers in [0, 1, 17, 31] {
+            p.io = StageIo::Cs(ComputeIo { rsrc2: registers << 1, threads: [1; 3] });
+            assert!(!p.is_spilled(), "registers={registers}");
+        }
+        for registers in [2, 5, 16] {
+            p.io = StageIo::Cs(ComputeIo { rsrc2: registers << 1, threads: [1; 3] });
+            assert!(p.is_spilled());
+        }
+        for first in [0, 15, 17, 20] {
+            p.layout[0].user_data = first;
+            assert!(!p.is_spilled(), "first={first}");
+        }
+        p.layout[0].user_data = 16;
+        p.layout[0].sgprs = 0;
+        assert!(!p.is_spilled());
+        p.layout[0].sgprs = 2;
+        p.stage = HwStage::Ms;
+        assert!(!p.is_spilled());
+        p.stage = HwStage::Cs;
+        p.io = StageIo::Vs { inputs: vec![], outputs: vec![] };
+        assert!(!p.is_spilled());
+        p.layout.clear();
+        assert!(!p.is_spilled());
     }
 
     #[test]

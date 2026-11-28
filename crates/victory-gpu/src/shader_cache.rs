@@ -310,6 +310,11 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
+        // Multi-wave lowerings are for a 32-lane host only.
+        no_if_convert: false,
+        no_sync_loops: false,
+        no_comm_waves: false,
         extra_params: 0,
         // `DispatchX` runs thread counts as group counts here (`list::dispatch_x`).
         thread_counts: false,

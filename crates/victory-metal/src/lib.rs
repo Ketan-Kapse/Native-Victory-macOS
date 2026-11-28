@@ -8,7 +8,13 @@ pub use victory_backend::{backend, resources};
 mod archive;
 #[cfg(target_os = "macos")]
 pub use archive::is_compiler_crash;
+#[cfg(any(target_os = "macos", test))]
+mod residency;
+#[cfg(any(target_os = "macos", test))]
+mod dense;
 pub mod disk;
+#[cfg(target_os = "macos")]
+pub mod frame_time;
 #[cfg(target_os = "macos")]
 pub mod gfx;
 #[cfg(target_os = "macos")]

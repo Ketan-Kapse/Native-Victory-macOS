@@ -6,6 +6,7 @@
 //! is needed at build time.
 
 use crate::backend::{ComputeBackend, Heaps, RootArgs};
+use crate::frame_time::{self, Metric, Timer};
 use crate::metal::{Buffer, Metal, Queue};
 use crate::resources::*;
 use objc2::Message;
@@ -14,9 +15,18 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::*;
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
+use std::rc::Rc;
 
-type Res = Retained<ProtocolObject<dyn MTLResource>>;
+pub(crate) type Res = Retained<ProtocolObject<dyn MTLResource>>;
+pub(crate) type TextureObject = Retained<ProtocolObject<dyn MTLTexture>>;
+type HeapRef = (Res, Option<TextureObject>);
+type TextureViewKey = (usize, usize, usize, usize, usize, usize);
+
+const BUFFER_VIEWS: usize = 8192;
+const TEXTURE_VIEWS: usize = 64;
+const RETIRED_OBJECTS: usize = 512;
 
 /// A fence chaining the encoders of one command buffer, and whether one has run: what a pass waits
 /// for and updates when the queue's buffers are made resident by a set instead of named.
@@ -44,34 +54,204 @@ pub struct Heap {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     kind: HeapKind,
     count: usize,
+    trace_mirrors: bool,
+    fast_buffers: bool,
+    raw_buffers: RefCell<HashMap<usize, std::rc::Weak<HeapRef>>>,
     /// What each entry names: `(resident_allocation, optional_buffer_backed_texture_view)`.
     /// A buffer-backed `TypeTextureBuffer` shares its parent `MTLBuffer`'s backing allocation, so
     /// retaining it here keeps its `gpuResourceID` live without duplicating the pool's pages in
     /// `alloc_counts` / `MTLResidencySet` / per-encoder `useResource`.
-    refs: RefCell<std::collections::HashMap<usize, (Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>>,
-    /// Entries in `refs` that currently hold `Some(texture_buffer)`.
+    refs: RefCell<std::collections::HashMap<usize, Rc<HeapRef>>>,
+    /// Entries holding a typed buffer view.
     typed_views: Cell<usize>,
     /// The distinct allocations `refs` names, by raw `MTLResource` pointer, with how many entries
-    /// name each: an allocation is added to `set` once and removed + committed before its last
-    /// `refs` entry is dropped, and without a set each is named to an encoder once.
+    /// name each: the desired membership of `set`, reconciled only at commit.
+    /// Removed objects stay in `retired` until commit; without a set each is named once per encoder.
     alloc_counts: RefCell<std::collections::HashMap<usize, (usize, Res)>>,
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
+    /// Committed allocations, excluding the heap buffer (which stays until Drop).
+    in_set: RefCell<HashSet<usize>>,
     dirty: Cell<bool>,
     /// The set asked to stay resident (`VICTORY_METAL_REQUEST_RESIDENCY`): it ends that when dropped.
     requested: bool,
+    /// MTLResidencySet does not retain allocations, even while a removal awaits commit.
+    retired: RefCell<HashMap<usize, Res>>,
+    retired_views: RefCell<Vec<TextureObject>>,
+    /// The same ownership as arrays (`crate::dense`), which replaces `refs`, `alloc_counts`,
+    /// `in_set`, `retired`, `retired_views` and `raw_buffers` (they stay empty) unless
+    /// `VICTORY_DENSE_ENTRIES=0` keeps the maps as the reference.
+    dense: Option<RefCell<crate::dense::Dense<Res, TextureObject>>>,
+    /// Per-heap commits, including creation, for residency lifetime regression tests.
+    set_commits: Cell<u64>,
+}
+
+/// Prepared Metal descriptor words and ownership, independent of any heap slot. Sampler IDs
+/// remain owned by Metal's existing sampler cache for the device's lifetime.
+#[derive(Clone)]
+pub struct Descriptor {
+    words: [u64; 3],
+    keep: Option<Rc<HeapRef>>,
+    kind: Metric,
+}
+
+impl Heap {
+    pub fn capture_descriptor(&self, index: usize) -> Descriptor {
+        assert!(index < self.count);
+        // SAFETY: the checked slot is live; the descriptor writer excludes concurrent GPU use.
+        let words = unsafe { self.buf.contents().as_ptr().cast::<[u64; 3]>().add(index).read() };
+        let keep = match &self.dense {
+            Some(dense) => dense.borrow().get(index).map(|(_, r, view)| Rc::new((r.clone(), view.cloned()))),
+            None => self.refs.borrow().get(&index).cloned(),
+        };
+        let kind = if self.kind == HeapKind::Sampler { Metric::MirrorSampler }
+            else if keep.as_ref().is_some_and(|r| r.1.is_some()) { Metric::MirrorTyped }
+            else if words[1] != 0 { Metric::MirrorImage }
+            else if words[2] == 0 { Metric::MirrorNull }
+            else { Metric::MirrorBuffer };
+        Descriptor { words, keep, kind }
+    }
+
+    /// Reconcile desired membership with the last commit: one add or one remove per allocation
+    /// per commit. Deferred entry-level adds/removes preceded an IOGPUGroupMemory kernel panic.
+    fn commit_set(&self, metal: &Metal) {
+        if let Some(set) = &self.set {
+            let Some(_changes) = RESIDENCY.changes() else { return };
+            let counts = self.alloc_counts.borrow();
+            let mut in_set = self.in_set.borrow_mut();
+            let mut retired = self.retired.borrow_mut();
+            let mut dense = self.dense.as_ref().map(|d| d.borrow_mut());
+            let (mut adds, mut removes) = (0, 0);
+            if self.set_commits.get() == 0 {
+                set.addAllocation(ProtocolObject::from_ref(&*self.buf));
+                adds += 1;
+            }
+            let add = |allocation: &Res| set.addAllocation(ProtocolObject::from_ref(&**allocation));
+            let remove = |allocation: &Res| set.removeAllocation(ProtocolObject::from_ref(&**allocation));
+            let (more_adds, more_removes) = match &mut dense {
+                Some(dense) => dense.reconcile(add, remove),
+                None => crate::residency::reconcile(&counts, &mut in_set, &retired, add, remove),
+            };
+            adds += more_adds;
+            removes += more_removes;
+            metal.count(|c| {
+                c.set_adds += adds;
+                c.set_removes += removes;
+            });
+            frame_time::count(Metric::SetAdds, adds);
+            frame_time::count(Metric::SetRemoves, removes);
+            if adds != 0 || removes != 0 {
+                self.publish_set(set);
+            }
+            // With no difference there is nothing pending in Metal, so retirement is safe too.
+            // Only here, after the set is published, do the removed allocations go.
+            // They are kept until the work submitted before has finished: a command buffer in
+            // flight may still read them through entries or table copies written before
+            // (docs/hang-notes.md).
+            let (mut gone, mut views) = match &mut dense {
+                Some(dense) => dense.finish_commit(),
+                None => (Vec::new(), Vec::new()),
+            };
+            views.append(&mut self.retired_views.borrow_mut());
+            gone.extend(retired.drain().map(|(_, r)| r));
+            metal.keep_until_done(gone, views);
+            self.dirty.set(false);
+        }
+    }
+
+    fn publish_set(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
+        let _commit = Timer::counted(Metric::SetCommit, Metric::SetCommits);
+        crate::metal::residency_timed("heap_commit", Some(set), || set.commit());
+        self.set_commits.set(self.set_commits.get() + 1);
+    }
+
+    /// Entries that name an allocation.
+    fn named_entries(&self) -> usize {
+        match &self.dense {
+            Some(dense) => dense.borrow().entries(),
+            None => self.refs.borrow().len(),
+        }
+    }
+
+    /// Distinct allocations the entries name.
+    fn named_allocations(&self) -> usize {
+        match &self.dense {
+            Some(dense) => dense.borrow().live(),
+            None => self.alloc_counts.borrow().len(),
+        }
+    }
+
+    /// Each distinct allocation the entries name, with its raw pointer.
+    fn each_allocation(&self, mut f: impl FnMut(usize, &Res)) {
+        match &self.dense {
+            Some(dense) => dense.borrow().counts().for_each(|(id, _, r)| f(id, r)),
+            None => self.alloc_counts.borrow().iter().for_each(|(&id, (_, r))| f(id, r)),
+        }
+    }
+
+    /// Each entry that names an allocation, with the allocation's raw pointer.
+    fn each_entry(&self, mut f: impl FnMut(usize, usize)) {
+        match &self.dense {
+            Some(dense) => dense.borrow().iter().for_each(|(index, id, ..)| f(index, id)),
+            None => self.refs.borrow().iter().for_each(|(&index, r)| {
+                f(index, (&*r.0 as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize)
+            }),
+        }
+    }
+
+    /// Removed objects (allocations, views) still owned for the next commit.
+    #[cfg(test)]
+    fn pending_retired(&self) -> (usize, usize) {
+        match &self.dense {
+            Some(dense) => {
+                let dense = dense.borrow();
+                (dense.retired(), dense.retired_views())
+            }
+            None => (self.retired.borrow().len(), self.retired_views.borrow().len()),
+        }
+    }
+
+    #[cfg(test)]
+    fn allocation_counts(&self) -> HashMap<usize, usize> {
+        match &self.dense {
+            Some(dense) => dense.borrow().counts().map(|(id, n, _)| (id, n)).collect(),
+            None => self.alloc_counts.borrow().iter().map(|(&id, (n, _))| (id, *n)).collect(),
+        }
+    }
+
+    /// The allocations the set holds as of the last commit, without the heap buffer.
+    #[cfg(test)]
+    fn committed(&self) -> HashSet<usize> {
+        match &self.dense {
+            Some(dense) => dense.borrow().membership(),
+            None => self.in_set.borrow().clone(),
+        }
+    }
+
+    /// The allocation (raw pointer) and typed view entry `index` names.
+    #[cfg(test)]
+    fn entry(&self, index: usize) -> Option<(usize, Option<TextureObject>)> {
+        match &self.dense {
+            Some(dense) => dense.borrow().get(index).map(|(id, _, view)| (id, view.cloned())),
+            None => self.refs.borrow().get(&index).map(|r| {
+                ((&*r.0 as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize, r.1.clone())
+            }),
+        }
+    }
 }
 
 impl Drop for Heap {
     fn drop(&mut self) {
         // MTLResidencySet does not retain allocations: detach everything and commit before
         // `buf` and `refs` are dropped.
-        if let Some(set) = self.set.take() {
+        if let Some(set) = &self.set {
+            let Some(_changes) = RESIDENCY.changes() else { return };
             if self.requested {
-                crate::metal::residency_timed("end", Some(&set), || set.endResidency());
+                crate::metal::residency_timed("end", Some(set), || set.endResidency());
             }
             set.removeAllAllocations();
-            crate::metal::residency_timed("drop_commit", Some(&set), || set.commit());
+            self.publish_set(set);
+            self.in_set.borrow_mut().clear();
         }
     }
 }
@@ -80,6 +260,11 @@ pub struct Texture {
     tex: Retained<ProtocolObject<dyn MTLTexture>>,
     /// What the pixels are as Metal reads them: sizes the CPU transfers' bounds check.
     format: Format,
+    /// Present reuses the display-value view instead of allocating an sRGB view each frame.
+    present_view: std::cell::OnceCell<Retained<ProtocolObject<dyn MTLTexture>>>,
+    /// Fitted format/type/mip/slice views. A view retains the Metal parent; that parent does
+    /// not retain the view. Heap entries retain views independently when this cache is cleared.
+    views: RefCell<std::collections::HashMap<TextureViewKey, TextureObject>>,
 }
 
 /// What a CPU transfer of a `w` x `h` x `d` mip needs of `format`: `(row bytes, total bytes)`, or the
@@ -119,9 +304,9 @@ impl Texture {
             MTLPixelFormat::BGRA8Unorm_sRGB => MTLPixelFormat::BGRA8Unorm,
             _ => return self.tex.clone(),
         };
-        self.tex
-            .newTextureViewWithPixelFormat(plain)
-            .unwrap_or_else(|| self.tex.clone())
+        self.present_view.get_or_init(|| {
+            self.tex.newTextureViewWithPixelFormat(plain).unwrap_or_else(|| self.tex.clone())
+        }).clone()
     }
 }
 
@@ -134,8 +319,11 @@ pub struct RenderPipeline {
     raster: Raster,
     /// The pipeline's target has a stencil plane (the pass attaches it too).
     stencil: bool,
-    /// A mesh pipeline: its thread-group size (the converter's reflection of the mesh shader).
-    mesh: Option<MTLSize>,
+    /// Made for no colour and no depth target ([`targetless_samples`]): its draws run in a pass
+    /// without attachments, and in no other.
+    targetless: bool,
+    mesh: Option<MeshDispatch>,
+    object_static: Option<StaticSamplers>,
     /// Each stage's static samplers, which the stage's argument buffer points at.
     vs_static: Option<StaticSamplers>,
     ps_static: Option<StaticSamplers>,
@@ -169,6 +357,15 @@ impl StaticSamplers {
     fn table(t: Option<&Self>) -> Option<&ProtocolObject<dyn MTLResource>> {
         t.map(|t| ProtocolObject::from_ref(&*t.table))
     }
+}
+
+pub(crate) struct MeshDispatch {
+    threads: MTLSize,
+    object_threads: MTLSize,
+    object: bool,
+    /// The further passes of a split mesh program (`MeshPipelineDesc::more`): a draw runs the
+    /// pipeline's own state and then each of these, with the same arguments.
+    more: Vec<RenderState>,
 }
 
 fn pixel_format(f: Format) -> MTLPixelFormat {
@@ -511,84 +708,154 @@ fn size(a: [usize; 3]) -> MTLSize {
 }
 
 impl Metal {
+    pub fn write_descriptor(&self, heap: &Heap, index: usize, entry: &Descriptor) {
+        self.heap_entry(heap, index, entry.words, entry.keep.clone(), entry.kind);
+    }
+
     fn heap_entry(
         &self,
         heap: &Heap,
         index: usize,
         words: [u64; 3],
-        keep: Option<(Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>,
+        keep: Option<Rc<HeapRef>>,
+        kind: Metric,
     ) {
-        assert!(
-            index < heap.count,
-            "descriptor index {index} out of {}",
-            heap.count
-        );
-        // SAFETY: `index` is inside the heap buffer, which is shared memory the GPU is not
-        // reading while the title writes descriptors (D3D12 has the same rule).
-        unsafe {
-            let p = heap
-                .buf
-                .contents()
-                .as_ptr()
-                .cast::<u64>()
-                .add(index * ENTRY / 8);
-            words
-                .iter()
-                .enumerate()
-                .for_each(|(i, w)| p.add(i).write_volatile(*w));
-        }
-        let added_typed = matches!(keep, Some((_, Some(_))));
-        let old = match keep {
-            Some((r, tex_view)) => {
-                let ptr = (&*r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
-                let mut counts = heap.alloc_counts.borrow_mut();
-                let (count, _) = counts.entry(ptr).or_insert_with(|| (0, r.clone()));
-                if *count == 0
-                    && let Some(set) = &heap.set
-                {
-                    set.addAllocation(ProtocolObject::from_ref(&*r));
-                    heap.dirty.set(true);
-                }
-                *count += 1;
-                drop(counts);
-                heap.refs.borrow_mut().insert(index, (r, tex_view))
+        assert!(index < heap.count, "descriptor index {index} out of {}", heap.count);
+        // SAFETY: index is inside the shared heap. The title must not change an entry while
+        // the GPU reads it (D3D12 has the same rule).
+        let p = unsafe { heap.buf.contents().as_ptr().cast::<u64>().add(index * ENTRY / 8) };
+        let allocation = |r: &Rc<HeapRef>| (&*r.0 as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
+        let new_id = keep.as_ref().map(allocation);
+        if let Some(dense) = &heap.dense {
+            let mut dense = dense.borrow_mut();
+            let (old_id, old_view) = match dense.get(index) {
+                Some((id, _, view)) => (Some(id), view),
+                None => (None, None),
+            };
+            let same_view = match (old_view, keep.as_ref().and_then(|r| r.1.as_ref())) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::ptr::eq(&**a, &**b),
+                _ => false,
+            };
+            // SAFETY: all three words belong to the checked slot.
+            if old_id == new_id && same_view && unsafe { (0..3).all(|i| p.add(i).read_volatile() == words[i]) } {
+                if heap.trace_mirrors { frame_time::count(Metric::EntrySame, 1); }
+                return;
             }
-            None => heap.refs.borrow_mut().remove(&index),
+            // SAFETY: same live slot, with descriptor-write exclusion as above.
+            unsafe { for (i, w) in words.iter().enumerate() { p.add(i).write_volatile(*w); } }
+            self.count(|c| c.entry_writes += 1);
+            if heap.trace_mirrors { frame_time::count(kind, 1); }
+            // The slab takes its own reference only for an allocation the heap does not hold;
+            // a changed offset, size or view of the same allocation changes no count.
+            let change = match &keep {
+                Some(r) => dense.set(index, new_id, || r.0.clone(), r.1.clone()),
+                None => dense.set(index, None, || unreachable!("nothing is named"), None),
+            };
+            heap.typed_views.set(dense.typed());
+            let full = dense.retired() + dense.retired_views() > RETIRED_OBJECTS;
+            drop(dense);
+            if heap.set.is_some() && (change.added || change.retired) {
+                heap.dirty.set(true);
+                if change.retired && full { heap.commit_set(self); }
+            }
+            return;
+        }
+        let mut refs = heap.refs.borrow_mut();
+        let old = refs.get(&index);
+        let old_id = old.map(allocation);
+        let same_allocation = old_id == new_id;
+        let same_view = match (old.and_then(|r| r.1.as_ref()), keep.as_ref().and_then(|r| r.1.as_ref())) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::ptr::eq(&**a, &**b),
+            _ => false,
         };
-        let removed_typed = matches!(old, Some((_, Some(_))));
+        // SAFETY: all three words belong to the checked slot.
+        if same_allocation && same_view && unsafe { (0..3).all(|i| p.add(i).read_volatile() == words[i]) } {
+            if heap.trace_mirrors { frame_time::count(Metric::EntrySame, 1); }
+            return;
+        }
+        // SAFETY: same live slot, with descriptor-write exclusion as above.
+        unsafe { for (i, w) in words.iter().enumerate() { p.add(i).write_volatile(*w); } }
+        self.count(|c| c.entry_writes += 1);
+        if heap.trace_mirrors { frame_time::count(kind, 1); }
+        // Changing an offset, byte size, or texture-buffer view of the same allocation cannot
+        // change residency. In particular raw -> typed -> raw never touches alloc_counts.
+        let (added, retired) = if same_allocation { (false, None) } else {
+            crate::residency::replace(&mut heap.alloc_counts.borrow_mut(), old_id,
+                keep.as_ref().map(|r| (new_id.expect("allocation"), &r.0)))
+        };
+        if let Some((id, _)) = &retired { heap.raw_buffers.borrow_mut().remove(id); }
+        let added_typed = keep.as_ref().is_some_and(|r| r.1.is_some());
+        let old = match keep {
+            Some(r) => refs.insert(index, r),
+            None => refs.remove(&index),
+        };
+        drop(refs);
+        let removed_typed = old.as_ref().is_some_and(|r| r.1.is_some());
         if added_typed != removed_typed {
             let n = heap.typed_views.get();
-            heap.typed_views
-                .set(if added_typed { n + 1 } else { n - 1 });
+            heap.typed_views.set(if added_typed { n + 1 } else { n - 1 });
         }
-        if let Some((old, old_tex_view)) = old {
-            let old_ptr = (&*old as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
-            let mut counts = heap.alloc_counts.borrow_mut();
-            let last = match counts.get_mut(&old_ptr) {
-                Some((n, _)) if *n > 1 => {
-                    *n -= 1;
-                    false
-                }
-                Some(_) => {
-                    counts.remove(&old_ptr);
-                    true
-                }
-                None => false,
-            };
-            drop(counts);
-            if last && let Some(set) = &heap.set {
-                set.removeAllocation(ProtocolObject::from_ref(&*old));
-                crate::metal::residency_timed("remove_commit", Some(set), || set.commit());
-                heap.dirty.set(false);
+        if heap.set.is_some() {
+            if added { heap.dirty.set(true); }
+            if let Some((id, allocation)) = retired {
+                heap.dirty.set(true);
+                let mut retired = heap.retired.borrow_mut();
+                retired.insert(id, allocation);
+                let mut views = heap.retired_views.borrow_mut();
+                if let Some(view) = old.as_ref().and_then(|r| r.1.as_ref()) { views.push(view.clone()); }
+                let full = retired.len() + views.len() > RETIRED_OBJECTS;
+                drop(views);
+                drop(retired);
+                if full { heap.commit_set(self); }
             }
-            drop(old_tex_view);
-            drop(old);
         }
+    }
+
+    /// A descriptor heap whose entry ownership is dense arrays (`dense`) or the reference maps.
+    fn create_heap_as(&self, kind: HeapKind, count: usize, dense: bool) -> Result<Heap, String> {
+        let buf = self
+            .dev
+            .newBufferWithLength_options(count * ENTRY, MTLResourceOptions::StorageModeShared)
+            .ok_or("descriptor heap allocation failed")?;
+        let set = if self.residency_sets {
+            let d = MTLResidencySetDescriptor::new();
+            let s = self
+                .dev
+                .newResidencySetWithDescriptor_error(&d)
+                .map_err(|e| e.localizedDescription().to_string())?;
+            Some(track_residency_set(s))
+        } else {
+            None
+        };
+        let heap = Heap {
+            dense: dense.then(|| RefCell::new(crate::dense::Dense::new(count, set.is_some()))),
+            buf,
+            kind,
+            count,
+            trace_mirrors: frame_time::enabled(),
+            fast_buffers: std::env::var("VICTORY_BUFFER_FAST").as_deref() != Ok("0"),
+            raw_buffers: RefCell::default(),
+            refs: RefCell::default(),
+            typed_views: Cell::new(0),
+            alloc_counts: RefCell::default(),
+            requested: set.is_some() && self.request_residency,
+            set,
+            in_set: RefCell::default(),
+            dirty: Cell::new(false),
+            retired: RefCell::default(),
+            retired_views: RefCell::default(),
+            set_commits: Cell::new(0),
+        };
+        heap.commit_set(self);
+        if let Some(set) = &heap.set { self.request(set); }
+        Ok(heap)
     }
 
     /// A command buffer of `queue`, with encoder execution status when tracing failures.
     fn new_command_buffer(&self, queue: &Queue) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, String> {
-        if self.trace_fails {
+        if self.trace_fails && self.encoder_status {
             let d = MTLCommandBufferDescriptor::new();
             d.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
             queue.0.commandBufferWithDescriptor(&d)
@@ -635,6 +902,7 @@ impl Metal {
     /// fall follows a stall, it does not cause it.
     fn request(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
         if self.request_residency {
+            let Some(_changes) = RESIDENCY.changes() else { return };
             crate::metal::residency_timed("request", Some(set), || set.requestResidency());
             self.count(|c| c.requests += 1);
         }
@@ -647,13 +915,14 @@ impl Metal {
         attached_heaps: &mut Vec<*const Heap>,
         attach: impl FnOnce(&ProtocolObject<dyn MTLResidencySet>),
     ) {
+        let _heap_sets = Timer::new(Metric::HeapSets);
         if let Some(set) = &heap.set {
-            if heap.dirty.replace(false) {
-                crate::metal::residency_timed("add_commit", Some(set), || set.commit());
+            if heap.dirty.get() {
+                heap.commit_set(self);
                 self.request(set);
                 self.count(|c| {
-                    c.heap_entries = c.heap_entries.max(heap.refs.borrow().len() as u64);
-                    c.heap_allocations = c.heap_allocations.max(heap.alloc_counts.borrow().len() as u64);
+                    c.heap_entries = c.heap_entries.max(heap.named_entries() as u64);
+                    c.heap_allocations = c.heap_allocations.max(heap.named_allocations() as u64);
                     c.heap_set_bytes = c.heap_set_bytes.max(set.allocatedSize());
                 });
             }
@@ -679,13 +948,13 @@ impl Metal {
         }
         named.push(heap);
         use_res(ProtocolObject::from_ref(&*heap.buf));
-        let refs = heap.refs.borrow().len() as u64;
-        let allocations = heap.alloc_counts.borrow();
-        allocations.values().for_each(|(_, r)| use_res(r));
+        let refs = heap.named_entries() as u64;
+        let allocations = heap.named_allocations() as u64;
+        heap.each_allocation(|_, r| use_res(r));
         self.count(|c| {
-            c.heap_resources += 1 + allocations.len() as u64;
+            c.heap_resources += 1 + allocations;
             c.heap_entries = c.heap_entries.max(refs);
-            c.heap_allocations = c.heap_allocations.max(allocations.len() as u64);
+            c.heap_allocations = c.heap_allocations.max(allocations);
         });
     }
 
@@ -784,28 +1053,32 @@ impl Metal {
         e: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         root: &RootArgs,
         fragment: Option<&RootArgs>,
+        object: Option<&RootArgs>,
         heaps: &Heaps<'_, Metal>,
         pipeline: &RenderPipeline,
         named: &mut Vec<*const Heap>,
     ) {
+        let mesh = pipeline.mesh.as_ref();
         let fragment = fragment.unwrap_or(root);
-        let (vs, ps) = (pipeline.vs_static.as_ref(), pipeline.ps_static.as_ref());
-        let (root, fragment) = (
+        let object = object.unwrap_or(root);
+        let (vs, ps, os) = (pipeline.vs_static.as_ref(), pipeline.ps_static.as_ref(), pipeline.object_static.as_ref());
+        let (root, fragment, object) = (
             StaticSamplers::args(vs, &root.0),
             StaticSamplers::args(ps, &fragment.0),
+            StaticSamplers::args(os, &object.0),
         );
-        // A mesh pipeline's first stage takes what a vertex shader would.
-        let mesh = pipeline.mesh.is_some();
-        let first = if mesh { MTLRenderStages::Mesh } else { MTLRenderStages::Vertex };
         // SAFETY: setBytes copies the bytes before returning.
         unsafe {
             if !root.is_empty() {
                 let p = NonNull::new(root.as_ptr().cast_mut().cast()).unwrap();
-                if mesh {
+                if mesh.is_some() {
                     e.setMeshBytes_length_atIndex(p, root.len(), ARGUMENT_BUFFER);
                 } else {
                     e.setVertexBytes_length_atIndex(p, root.len(), ARGUMENT_BUFFER);
                 }
+            }
+            if mesh.is_some_and(|m| m.object) && !object.is_empty() {
+                e.setObjectBytes_length_atIndex(NonNull::new(object.as_ptr().cast_mut().cast()).unwrap(), object.len(), ARGUMENT_BUFFER);
             }
             if !fragment.is_empty() {
                 let p = NonNull::new(fragment.as_ptr().cast_mut().cast()).unwrap();
@@ -813,7 +1086,8 @@ impl Metal {
             }
         }
         for (t, stage) in [
-            (vs, first),
+            (vs, if mesh.is_some() { MTLRenderStages::Mesh } else { MTLRenderStages::Vertex }),
+            (os, MTLRenderStages::Object),
             (ps, MTLRenderStages::Fragment),
         ] {
             if let Some(t) = StaticSamplers::table(t) {
@@ -827,8 +1101,9 @@ impl Metal {
             if let Some(h) = h {
                 // SAFETY: a live buffer at an in-range slot.
                 unsafe {
-                    if mesh {
+                    if let Some(m) = mesh {
                         e.setMeshBuffer_offset_atIndex(Some(&h.buf), 0, slot);
+                        if m.object { e.setObjectBuffer_offset_atIndex(Some(&h.buf), 0, slot); }
                     } else {
                         e.setVertexBuffer_offset_atIndex(Some(&h.buf), 0, slot);
                     }
@@ -838,7 +1113,8 @@ impl Metal {
                     e.useResource_usage_stages(
                         r,
                         MTLResourceUsage::Read | MTLResourceUsage::Write,
-                        first | MTLRenderStages::Fragment,
+                        // A heap is named once per encoder, which may mix vertex and mesh draws.
+                        MTLRenderStages::Vertex | MTLRenderStages::Mesh | MTLRenderStages::Object | MTLRenderStages::Fragment,
                     )
                 });
             }
@@ -851,34 +1127,7 @@ impl ResourceBackend for Metal {
     type Sampler = Sampler;
 
     fn create_heap(&self, kind: HeapKind, count: usize) -> Result<Heap, String> {
-        let buf = self
-            .dev
-            .newBufferWithLength_options(count * ENTRY, MTLResourceOptions::StorageModeShared)
-            .ok_or("descriptor heap allocation failed")?;
-        let set = if self.residency_sets {
-            let d = MTLResidencySetDescriptor::new();
-            let s = self
-                .dev
-                .newResidencySetWithDescriptor_error(&d)
-                .map_err(|e| e.localizedDescription().to_string())?;
-            s.addAllocation(ProtocolObject::from_ref(&*buf));
-            crate::metal::residency_timed("made", Some(&s), || s.commit());
-            self.request(&s);
-            Some(track_residency_set(s))
-        } else {
-            None
-        };
-        Ok(Heap {
-            buf,
-            kind,
-            count,
-            refs: RefCell::default(),
-            typed_views: Cell::new(0),
-            alloc_counts: RefCell::default(),
-            requested: set.is_some() && self.request_residency,
-            set,
-            dirty: Cell::new(false),
-        })
+        self.create_heap_as(kind, count, std::env::var("VICTORY_DENSE_ENTRIES").as_deref() != Ok("0"))
     }
 
     fn heap_address(&self, heap: &Heap, index: usize) -> u64 {
@@ -895,9 +1144,80 @@ impl ResourceBackend for Metal {
     ) {
         debug_assert_eq!(heap.kind, HeapKind::Resource);
         let gpu = self.gpu_address(buffer, title);
-        let keep: Res = ProtocolObject::from_ref(&*buffer.buf).retain();
+        let kind = if size == 0 { Metric::MirrorNull } else { Metric::MirrorBuffer };
+        let allocation: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*buffer.buf);
+        let id = (allocation as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
+        let words = [gpu, 0, u64::from(size)];
+        if let Some(dense) = heap.dense.as_ref().filter(|_| heap.fast_buffers) {
+            assert!(index < heap.count);
+            let mut dense = dense.borrow_mut();
+            let same = dense.is_raw(index, id);
+            // SAFETY: the slot is in bounds; the title excludes descriptor writes during use.
+            let p = unsafe { heap.buf.contents().as_ptr().cast::<[u64; 3]>().add(index) };
+            if same && unsafe { p.read_volatile() } == words {
+                if heap.trace_mirrors { frame_time::count(Metric::EntrySame, 1); }
+            } else {
+                unsafe { p.write_volatile(words); }
+                self.count(|c| c.entry_writes += 1);
+                if heap.trace_mirrors { frame_time::count(kind, 1); }
+            }
+            if same {
+                // Same allocation and raw view: only the three entry words can change.
+                if heap.trace_mirrors { frame_time::count(Metric::BufferFast, 1); }
+                return;
+            }
+            // A fresh or different slot: an index and an increment when the heap already holds
+            // the buffer (the pool of every view into it); the Metal object is retained only the
+            // first time. Counts still describe every slot, and commit_set reconciles from them.
+            let made = Cell::new(false);
+            let change = dense.set(index, Some(id), || { made.set(true); allocation.retain() }, None);
+            heap.typed_views.set(dense.typed());
+            let full = dense.retired() + dense.retired_views() > RETIRED_OBJECTS;
+            drop(dense);
+            if heap.trace_mirrors && !made.get() { frame_time::count(Metric::BufferRetained, 1); }
+            if heap.set.is_some() && (change.added || change.retired) {
+                heap.dirty.set(true);
+                if change.retired && full { heap.commit_set(self); }
+            }
+            return;
+        }
+        if heap.fast_buffers {
+            assert!(index < heap.count);
+            let refs = heap.refs.borrow();
+            if let Some(old) = refs.get(&index)
+                && old.1.is_none() && std::ptr::eq(&*old.0, allocation)
+            {
+                // Same allocation and raw view: only the three entry words can change. In
+                // particular no retain/release, Rc allocation, reference-count update or
+                // residency-set mutation is needed. commit_set still reconciles every change.
+                // SAFETY: the slot is in bounds; the title excludes descriptor writes during use.
+                let p = unsafe { heap.buf.contents().as_ptr().cast::<[u64; 3]>().add(index) };
+                if unsafe { p.read_volatile() } == words {
+                    if heap.trace_mirrors { frame_time::count(Metric::EntrySame, 1); }
+                } else {
+                    unsafe { p.write_volatile(words); }
+                    self.count(|c| c.entry_writes += 1);
+                    if heap.trace_mirrors { frame_time::count(kind, 1); }
+                }
+                if heap.trace_mirrors { frame_time::count(Metric::BufferFast, 1); }
+                return;
+            }
+        }
+        // Fresh ring slots can share the heap's existing ownership of the pool. Weak entries
+        // neither prolong allocations nor evade the desired-count/retirement invariant.
+        let keep = if heap.fast_buffers {
+            let mut raw = heap.raw_buffers.borrow_mut();
+            if let Some(keep) = raw.get(&id).and_then(std::rc::Weak::upgrade) {
+                if heap.trace_mirrors { frame_time::count(Metric::BufferRetained, 1); }
+                keep
+            } else {
+                let keep = Rc::new((allocation.retain(), None));
+                raw.insert(id, Rc::downgrade(&keep));
+                keep
+            }
+        } else { Rc::new((allocation.retain(), None)) };
         // IRDescriptorTableSetBuffer(entry, gpu, metadata = size & 0xffffffff).
-        self.heap_entry(heap, index, [gpu, 0, size as u64], Some((keep, None)));
+        self.heap_entry(heap, index, words, Some(keep), kind);
     }
 
     fn write_typed_buffer(
@@ -951,26 +1271,40 @@ impl ResourceBackend for Metal {
             self.write_buffer(heap, index, buffer, title, size);
             return false;
         }
-        let td = MTLTextureDescriptor::new();
-        td.setTextureType(MTLTextureType::TypeTextureBuffer);
-        td.setPixelFormat(pf);
-        // SAFETY: `width` is in `1..=(1 << 26)` and fits inside `buffer.buf`.
-        unsafe {
-            td.setWidth(width);
-        }
-        td.setStorageMode(MTLStorageMode::Shared);
-        let mut usage = MTLTextureUsage::ShaderRead;
-        if writable {
-            usage |= MTLTextureUsage::ShaderWrite;
-        }
-        td.setUsage(usage);
-        let Some(tex) = buffer
-            .buf
-            .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, width * elem_bytes)
-        else {
-            self.write_buffer(heap, index, buffer, title, size);
-            return false;
+        let key = (offset, width, pf.0, writable);
+        let mut views = buffer.views.borrow_mut();
+        let tex = if let Some(tex) = views.get(&key) {
+            frame_time::count(Metric::TexbufCached, 1);
+            tex.clone()
+        } else {
+            let td = MTLTextureDescriptor::new();
+            td.setTextureType(MTLTextureType::TypeTextureBuffer);
+            td.setPixelFormat(pf);
+            // SAFETY: `width` is in `1..=(1 << 26)` and fits inside `buffer.buf`.
+            unsafe {
+                td.setWidth(width);
+            }
+            td.setStorageMode(MTLStorageMode::Shared);
+            let mut usage = MTLTextureUsage::ShaderRead;
+            if writable {
+                usage |= MTLTextureUsage::ShaderWrite;
+            }
+            td.setUsage(usage);
+            let Some(tex) = buffer
+                .buf
+                .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, width * elem_bytes)
+            else {
+                self.write_buffer(heap, index, buffer, title, size);
+                return false;
+            };
+            frame_time::count(Metric::TexbufMade, 1);
+            if views.len() >= BUFFER_VIEWS {
+                views.clear();
+            }
+            views.insert(key, tex.clone());
+            tex
         };
+        drop(views);
         let gpu = self.gpu_address(buffer, title);
         let tex_id = resource_id(tex.gpuResourceID());
         let keep_buf: Res = ProtocolObject::from_ref(&*buffer.buf).retain();
@@ -978,7 +1312,8 @@ impl ResourceBackend for Metal {
             heap,
             index,
             [gpu, tex_id, size as u64],
-            Some((keep_buf, Some(tex))),
+            Some(Rc::new((keep_buf, Some(tex)))),
+            Metric::MirrorTyped,
         );
         true
     }
@@ -988,18 +1323,18 @@ impl ResourceBackend for Metal {
         let id = resource_id(t.tex.gpuResourceID());
         let keep: Res = ProtocolObject::from_ref(&*t.tex).retain();
         // IRDescriptorTableSetTexture(entry, tex, minLODClamp, metadata = 0).
-        self.heap_entry(heap, index, [0, id, min_lod.to_bits() as u64], Some((keep, None)));
+        self.heap_entry(heap, index, [0, id, min_lod.to_bits() as u64], Some(Rc::new((keep, None))), Metric::MirrorImage);
     }
 
     fn write_sampler(&self, heap: &Heap, index: usize, s: &Sampler, lod_bias: f32) {
         debug_assert_eq!(heap.kind, HeapKind::Sampler);
         let id = resource_id(s.0.gpuResourceID());
         // IRDescriptorTableSetSampler(entry, sampler, lodBias): samplers need no residency.
-        self.heap_entry(heap, index, [id, 0, lod_bias.to_bits() as u64], None);
+        self.heap_entry(heap, index, [id, 0, lod_bias.to_bits() as u64], None, Metric::MirrorSampler);
     }
 
     fn clear_entry(&self, heap: &Heap, index: usize) {
-        self.heap_entry(heap, index, [0; 3], None);
+        self.heap_entry(heap, index, [0; 3], None, Metric::MirrorNull);
     }
 
     fn heap_typed_views(&self, heap: &Heap) -> usize {
@@ -1011,16 +1346,15 @@ impl ResourceBackend for Metal {
         heap.set.as_ref()?;
         // Each allocation's latest use over the entries naming it.
         let mut latest = std::collections::HashMap::<usize, u32>::new();
-        for (&index, (r, _)) in heap.refs.borrow().iter() {
-            let ptr = (&**r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
+        heap.each_entry(|index, ptr| {
             let used = last_used.get(index).copied().unwrap_or(0);
             let e = latest.entry(ptr).or_insert(0);
             *e = (*e).max(used);
-        }
+        });
         // A view's (or a texture over a buffer's) memory is its parent's: count the allocation under
         // it, once, with the latest use over every object made of it.
         let mut under = std::collections::HashMap::<usize, HeapAllocation>::new();
-        for (&id, (_, r)) in heap.alloc_counts.borrow().iter() {
+        heap.each_allocation(|id, r| {
             let used = latest.get(&id).copied().unwrap_or(0);
             let texture = r.respondsToSelector(objc2::sel!(textureType));
             let root: Res = if texture {
@@ -1041,8 +1375,12 @@ impl ResourceBackend for Metal {
                 .entry(rid)
                 .and_modify(|a| a.latest = a.latest.max(used))
                 .or_insert(HeapAllocation { id: rid, bytes: MTLResource::allocatedSize(&*root) as u64, latest: used, texture });
-        }
+        });
         Some(under.into_values().collect())
+    }
+
+    fn texture_bytes(&self, t: &Texture) -> u64 {
+        MTLResource::allocatedSize(&*t.tex) as u64
     }
 
     fn create_texture(&self, d: &TextureDesc) -> Result<Texture, String> {
@@ -1078,7 +1416,7 @@ impl ResourceBackend for Metal {
             .dev
             .newTextureWithDescriptor(&td)
             .ok_or("newTextureWithDescriptor failed")?;
-        Ok(Texture { tex, format: d.format })
+        Ok(Texture { tex, format: d.format, present_view: Default::default(), views: Default::default() })
     }
 
     fn create_texture_view(&self, t: &Texture, v: &ViewDesc) -> Result<Texture, String> {
@@ -1117,13 +1455,26 @@ impl ResourceBackend for Metal {
                 v.mips, v.slices
             ));
         };
-        // SAFETY: the ranges are inside the texture.
-        let tex = unsafe {
-            t.tex
-                .newTextureViewWithPixelFormat_textureType_levels_slices(format, ty, levels, layers)
-        }
-        .ok_or("newTextureView refused (format not view-compatible)")?;
-        Ok(Texture { tex, format: title_format })
+        let key = (format.0, ty.0, levels.location, levels.length, layers.location, layers.length);
+        let mut views = t.views.borrow_mut();
+        let tex = if let Some(tex) = views.get(&key) {
+            frame_time::count(Metric::ViewCached, 1);
+            tex.clone()
+        } else {
+            // SAFETY: the ranges are inside the texture.
+            let tex = unsafe {
+                t.tex
+                    .newTextureViewWithPixelFormat_textureType_levels_slices(format, ty, levels, layers)
+            }
+            .ok_or("newTextureView refused (format not view-compatible)")?;
+            frame_time::count(Metric::ViewMade, 1);
+            if views.len() >= TEXTURE_VIEWS {
+                views.clear();
+            }
+            views.insert(key, tex.clone());
+            tex
+        };
+        Ok(Texture { tex, format: title_format, present_view: Default::default(), views: Default::default() })
     }
 
     fn create_texture_over_memory(
@@ -1153,7 +1504,7 @@ impl ResourceBackend for Metal {
             .buf
             .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, row_pitch)
             .ok_or("buffer-backed texture refused (offset, pitch or format)")?;
-        Ok(Texture { tex, format: d.format })
+        Ok(Texture { tex, format: d.format, present_view: Default::default(), views: Default::default() })
     }
 
     fn linear_alignment(&self, f: Format) -> usize {
@@ -1245,10 +1596,39 @@ impl ResourceBackend for Metal {
     }
 }
 
+/// Identity of all stages and state owned by an off-thread render compile.
+fn render_key(d: &RenderPipelineDesc<'_>) -> [u8; 32] {
+    let state = format!(
+        "{} {:?}",
+        d.vs.len(),
+        (d.vs_layout, d.ps_layout, d.attributes, d.streams, d.color, d.depth, d.depth_test, d.cull, d.color_state, d.dual_source, d.stencil, d.raster)
+    );
+    let mut key = blake3::Hasher::new();
+    key.update(d.vs).update(d.ps.unwrap_or_default()).update(state.as_bytes());
+    if let Some(m) = &d.mesh {
+        key.update(b"mesh").update(&m.mesh.len().to_le_bytes()).update(m.mesh);
+        for pass in m.more {
+            key.update(b"pass").update(&pass.len().to_le_bytes()).update(pass);
+        }
+        key.update(m.amplification.unwrap_or_default());
+        key.update(format!("{:?} {:?} {:?}", m.layout, m.amplification.map(<[u8]>::len), m.amplification_layout).as_bytes());
+    }
+    *key.finalize().as_bytes()
+}
+
 /// What a compiler crash is remembered by: the two stages' DXIL (the crash is in compiling them,
 /// whatever the targets and state).
 fn crash_key(d: &RenderPipelineDesc<'_>) -> String {
-    crate::disk::key(&[d.vs, d.ps.unwrap_or_default()])
+    match &d.mesh {
+        Some(m) => mesh_crash_key(d, m),
+        None => crate::disk::key(&[d.vs, d.ps.unwrap_or_default()]),
+    }
+}
+
+/// [`crash_key`] of one mesh stage: each pass of a split mesh program is compiled, and
+/// remembered, by itself.
+fn mesh_crash_key(d: &RenderPipelineDesc<'_>, m: &MeshPipelineDesc<'_>) -> String {
+    crate::disk::key(&[m.mesh, m.amplification.unwrap_or_default(), d.ps.unwrap_or_default()])
 }
 
 impl GraphicsBackend for Metal {
@@ -1266,12 +1646,7 @@ impl GraphicsBackend for Metal {
         d: &RenderPipelineDesc<'_>,
         wait: std::time::Duration,
     ) -> Result<Option<RenderPipeline>, String> {
-        let state = format!(
-            "{} {:?}",
-            d.vs.len(),
-            (d.vs_layout, d.ps_layout, d.attributes, d.streams, d.color, d.depth, d.depth_test, d.cull, d.color_state, d.dual_source, d.stencil, d.raster)
-        );
-        let key = *blake3::Hasher::new().update(d.vs).update(d.ps.unwrap_or_default()).update(state.as_bytes()).finalize().as_bytes();
+        let key = render_key(d);
         let made = crate::metal::within(&self.compiling_render, key, wait, || {
             let (compiler, owned) = (self.compiler()?, OwnedDesc::of(d));
             Ok(move || compiler.render(&owned.desc()))
@@ -1279,14 +1654,20 @@ impl GraphicsBackend for Metal {
         made.map(|made| made.and_then(|(pso, mesh)| self.finish_render(d, pso, mesh))).transpose()
     }
 
+    fn render_pipeline_targetless(&self, p: &RenderPipeline) -> bool {
+        p.targetless
+    }
+
     fn name_render_pipeline(&self, p: &RenderPipeline, name: &str) {
-        if self.trace_fails {
+        if self.trace_fails || self.gate_stats.is_some() {
             let key = Retained::as_ptr(&p.pso) as *const u8 as usize;
             self.pipe_names.borrow_mut().insert(key, name.to_string());
         }
     }
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), SubmitFailure> {
+        self.let_go_of_done();
+        self.log_gate_stats();
         if self.trace_fails {
             report_in_flight();
             self.trace_enc.borrow_mut().clear();
@@ -1355,13 +1736,20 @@ impl GraphicsBackend for Metal {
         for (n, pass) in work.passes.iter().enumerate() {
             let encoded = match pass {
                 Pass::Compute(dispatches) => {
+                    let _encode = Timer::counted(Metric::EncCompute, Metric::PassesCompute);
                     self.encode_compute(&cb, dispatches, set_on_queue, order, &mut attached_heaps)
                 }
                 Pass::Render(rp) => {
+                    let _encode = Timer::counted(Metric::EncRender, Metric::PassesRender);
                     self.encode_render(&cb, rp, set_on_queue, order, &mut attached_heaps)
                 }
-                Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
+                Pass::Blit(ops) => {
+                    let _encode = Timer::counted(Metric::EncBlit, Metric::PassesBlit);
+                    self.encode_blit(&cb, ops, order)
+                }
                 Pass::ClearColorRects { target, color, rects } => {
+                    // Include the scratch render and copies here, without timing them twice.
+                    let _encode = Timer::counted(Metric::EncRender, Metric::PassesClear);
                     self.encode_color_clear_rects(&cb, target, *color, rects, set_on_queue, order, &mut attached_heaps)
                 }
             };
@@ -1428,10 +1816,25 @@ impl GraphicsBackend for Metal {
             IN_FLIGHT.lock().unwrap().insert(*s, (std::time::Instant::now(), format!("{l} | {enc}")));
             GATED.lock().unwrap().insert(*s, std::mem::take(&mut *self.trace_args.borrow_mut()));
         }
+        // The handler is installed before commit, but latency must start at commit, not before
+        // allocating/copying the block. This shared timestamp exists only with tracing enabled.
+        let committed = frame_time::enabled().then(|| {
+            std::sync::Arc::new(std::sync::OnceLock::<std::time::Instant>::new())
+        });
+        let completed_commit = committed.clone();
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            if let Some(started) = completed_commit.as_ref().and_then(|t| t.get()) {
+                frame_time::completed(
+                    started.elapsed(),
+                    done.GPUStartTime(),
+                    done.GPUEndTime(),
+                    done.kernelStartTime(),
+                    done.kernelEndTime(),
+                );
+            }
             trace_done(serial, done);
             landed(serial, queue_id, done.error().is_some());
             if let Some((s, l, enc)) = &tinfo {
@@ -1463,7 +1866,12 @@ impl GraphicsBackend for Metal {
         });
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
+        let commit = Timer::counted(Metric::Commit, Metric::Cbs);
+        if let (Some(stamp), Some(started)) = (&committed, commit.started()) {
+            let _ = stamp.set(started);
+        }
         crate::metal::residency_timed("cb_commit", None, || cb.commit());
+        drop(commit);
         self.committed.set(self.committed.get() + 1);
         match first_error {
             Some(e) => Err(SubmitFailure {
@@ -1479,8 +1887,26 @@ impl GraphicsBackend for Metal {
 impl RenderPipeline {
     /// A mesh pipeline's thread-group size (else `None`: a vertex pipeline).
     pub fn mesh_threads(&self) -> Option<[usize; 3]> {
-        self.mesh.map(|m| [m.width, m.height, m.depth])
+        self.mesh.as_ref().map(|m| [m.threads.width, m.threads.height, m.threads.depth])
     }
+
+    /// The passes a mesh draw of this pipeline runs: more than one for a split mesh program
+    /// (`MeshPipelineDesc::more`); 0 for a vertex pipeline.
+    pub fn mesh_passes(&self) -> usize {
+        self.mesh.as_ref().map_or(0, |m| 1 + m.more.len())
+    }
+}
+
+/// The raster sample count of a pipeline made for no target, and of the pass without attachments
+/// its draws run in. The title draws such passes with conservative rasterization (light volumes
+/// into a grid of screen tiles, 32 pixels a tile: a tile a volume touches anywhere takes the
+/// light), which Metal does not have. Four sample positions a pixel stand in for it: the pixel
+/// shader runs once for a pixel any of them covers.
+// shortcut: a primitive that crosses a pixel between all four sample positions is missed, where
+// conservative rasterization shades it; expand the primitives in a geometry step if a title's
+// lights are seen to drop out at the edges of their volumes.
+fn targetless_samples(dev: &ProtocolObject<dyn MTLDevice>) -> usize {
+    if dev.supportsTextureSampleCount(4) { 4 } else { 1 }
 }
 
 /// Formats, write masks and blending of the colour targets.
@@ -1514,6 +1940,53 @@ fn color_attachments(arr: &MTLRenderPipelineColorAttachmentDescriptorArray, d: &
             a.setDestinationAlphaBlendFactor(blend_factor(b.dst_alpha));
             a.setAlphaBlendOperation(blend_op(b.op_alpha));
         }
+    }
+}
+
+impl Metal {
+    /// Debugging: level 0 of a depth texture's depth plane as the GPU has it now (32-bit floats,
+    /// or 16-bit normalised values), read through a command buffer of its own that this waits
+    /// for. False if it was not read. A depth texture gives no bytes to `read_texture`.
+    pub fn debug_read_depth(&self, t: &Texture, out: &mut [u8]) -> bool {
+        let (texel, options) = match t.tex.pixelFormat() {
+            MTLPixelFormat::Depth32Float_Stencil8 => (4, MTLBlitOption::DepthFromDepthStencil),
+            MTLPixelFormat::Depth32Float => (4, MTLBlitOption::None),
+            MTLPixelFormat::Depth16Unorm => (2, MTLBlitOption::None),
+            _ => return false,
+        };
+        let (w, h) = (t.tex.width(), t.tex.height());
+        let len = w * h * texel;
+        if len == 0 || out.len() < len {
+            return false;
+        }
+        let Some(buf) = self.dev.newBufferWithLength_options(len.next_multiple_of(4096), MTLResourceOptions::StorageModeShared) else { return false };
+        let Some(queue) = self.dev.newCommandQueue() else { return false };
+        let Some(cb) = queue.commandBuffer() else { return false };
+        let Some(e) = cb.blitCommandEncoder() else { return false };
+        // SAFETY: the region is level 0 of the texture, and its rows fit the buffer.
+        unsafe {
+            e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                &t.tex,
+                0,
+                0,
+                origin([0, 0, 0]),
+                size([w, h, 1]),
+                &buf,
+                0,
+                w * texel,
+                len,
+                options,
+            )
+        };
+        e.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        if cb.status() != MTLCommandBufferStatus::Completed {
+            return false;
+        }
+        // SAFETY: the buffer holds `len` bytes the GPU has finished writing.
+        out[..len].copy_from_slice(unsafe { std::slice::from_raw_parts(buf.contents().as_ptr().cast::<u8>(), len) });
+        true
     }
 }
 
@@ -1557,10 +2030,23 @@ impl Metal {
             GATED.lock().unwrap().insert(serial, args);
             d
         });
+        let committed = frame_time::enabled().then(|| {
+            std::sync::Arc::new(std::sync::OnceLock::<std::time::Instant>::new())
+        });
+        let completed_commit = committed.clone();
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            if let Some(started) = completed_commit.as_ref().and_then(|t| t.get()) {
+                frame_time::completed(
+                    started.elapsed(),
+                    done.GPUStartTime(),
+                    done.GPUEndTime(),
+                    done.kernelStartTime(),
+                    done.kernelEndTime(),
+                );
+            }
             trace_done(serial, done);
             let error = done.error();
             landed(serial, queue_id, dropped || error.is_some());
@@ -1596,12 +2082,17 @@ impl Metal {
         });
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
+        let commit = Timer::counted(Metric::Commit, Metric::Cbs);
+        if let (Some(stamp), Some(started)) = (&committed, commit.started()) {
+            let _ = stamp.set(started);
+        }
         crate::metal::residency_timed("cb_commit", None, || cb.commit());
+        drop(commit);
         self.committed.set(self.committed.get() + 1);
     }
 
     /// The pipeline of a compiled state `pso`: what the passes set beside it.
-    fn finish_render(&self, d: &RenderPipelineDesc<'_>, pso: RenderState, mesh: Option<MTLSize>) -> Result<RenderPipeline, String> {
+    fn finish_render(&self, d: &RenderPipelineDesc<'_>, pso: RenderState, mesh: Option<MeshDispatch>) -> Result<RenderPipeline, String> {
         let has_stencil = d.depth == Some(Format::D32FloatS8);
         let depth = (d.depth_test.is_some() || (d.stencil.is_some() && has_stencil)).then(|| {
             let dd = MTLDepthStencilDescriptor::new();
@@ -1627,8 +2118,14 @@ impl Metal {
             cull,
             raster: d.raster,
             stencil: has_stencil,
+            // (A mesh pipeline is not given the pass's sample count: it stays a pipeline with targets.)
+            targetless: d.mesh.is_none() && d.color.is_empty() && d.depth.is_none(),
             mesh,
-            vs_static: self.static_samplers(d.vs_layout)?,
+            vs_static: self.static_samplers(d.mesh.as_ref().map_or(d.vs_layout, |m| m.layout))?,
+            object_static: match d.mesh.as_ref().filter(|m| m.amplification.is_some()) {
+                Some(m) => self.static_samplers(m.amplification_layout)?,
+                None => None,
+            },
             ps_static: if d.ps.is_some() {
                 self.static_samplers(d.ps_layout)?
             } else {
@@ -1640,8 +2137,40 @@ impl Metal {
 
 pub(crate) type RenderState = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 
+/// The mesh and object stages retained until their compile thread finishes.
+struct OwnedMesh {
+    mesh: Vec<u8>,
+    more: Vec<Vec<u8>>,
+    layout: Option<victory_backend::backend::RootLayout>,
+    amplification: Option<Vec<u8>>,
+    amplification_layout: Option<victory_backend::backend::RootLayout>,
+}
+
+impl OwnedMesh {
+    fn of(d: &MeshPipelineDesc<'_>) -> Self {
+        Self {
+            mesh: d.mesh.to_vec(),
+            more: d.more.to_vec(),
+            layout: d.layout.cloned(),
+            amplification: d.amplification.map(<[u8]>::to_vec),
+            amplification_layout: d.amplification_layout.cloned(),
+        }
+    }
+
+    fn desc(&self) -> MeshPipelineDesc<'_> {
+        MeshPipelineDesc {
+            mesh: &self.mesh,
+            layout: self.layout.as_ref(),
+            amplification: self.amplification.as_deref(),
+            amplification_layout: self.amplification_layout.as_ref(),
+            more: &self.more,
+        }
+    }
+}
+
 /// A `RenderPipelineDesc` that owns what it names, for the compile thread.
 struct OwnedDesc {
+    mesh: Option<OwnedMesh>,
     vs: Vec<u8>,
     ps: Option<Vec<u8>>,
     vs_layout: Option<victory_backend::backend::RootLayout>,
@@ -1661,6 +2190,7 @@ struct OwnedDesc {
 impl OwnedDesc {
     fn of(d: &RenderPipelineDesc<'_>) -> OwnedDesc {
         OwnedDesc {
+            mesh: d.mesh.as_ref().map(OwnedMesh::of),
             vs: d.vs.to_vec(),
             ps: d.ps.map(<[u8]>::to_vec),
             vs_layout: d.vs_layout.cloned(),
@@ -1680,6 +2210,7 @@ impl OwnedDesc {
 
     fn desc(&self) -> RenderPipelineDesc<'_> {
         RenderPipelineDesc {
+            mesh: self.mesh.as_ref().map(OwnedMesh::desc),
             vs: &self.vs,
             ps: self.ps.as_deref(),
             vs_layout: self.vs_layout.as_ref(),
@@ -1717,42 +2248,66 @@ impl crate::metal::Compiler {
         Ok((stage, l.newFunctionWithName(&name).ok_or("no function")?))
     }
 
-    /// The pipeline state of `d` and, for a mesh pipeline, its thread-group size.
-    pub(crate) fn render(&self, d: &RenderPipelineDesc<'_>) -> Result<(RenderState, Option<MTLSize>), String> {
-        // A pipeline that crashed Metal's compiler on an earlier run would only crash it again.
+    fn mesh_function(&self, dxil: &[u8], layout: Option<&victory_backend::backend::RootLayout>, amplification: bool)
+        -> Result<(Retained<ProtocolObject<dyn MTLFunction>>, crate::msc::MeshInfo), String>
+    {
+        let (lib, reflected) = self.msc.convert_mesh_with(dxil, layout, amplification).map_err(|e| e.to_string())?;
+        let library = crate::metal::load_library(&self.dev, &lib)?;
+        let name = objc2_foundation::NSString::from_str(&reflected.entry);
+        let f = library.newFunctionWithName(&name).ok_or("reflected mesh entry point is missing")?;
+        Ok((f, reflected.info))
+    }
+
+    /// Both described and guessed mesh stages use the reflected mesh path on this thread.
+    pub(crate) fn render(&self, d: &RenderPipelineDesc<'_>) -> Result<(RenderState, Option<MeshDispatch>), String> {
         if crate::disk::crashed(crash_key(d).as_bytes()) {
             return Err("Metal's compiler crashed on it on an earlier run".into());
         }
-        let (stage, vf) = self.stage_function(d.vs, d.vs_layout, false)?;
-        let ff = d
-            .ps
-            .map(|ps| self.stage_function(ps, d.ps_layout, d.dual_source))
-            .transpose()?
-            .map(|f| f.1);
-        let has_stencil = d.depth == Some(Format::D32FloatS8);
-        let (pso, mesh) = if stage == crate::msc::STAGE_MESH {
-            let [x, y, z] = self.msc.mesh_threads(d.vs, d.vs_layout).map_err(|e| e.to_string())?;
-            let md = MTLMeshRenderPipelineDescriptor::new();
-            // SAFETY: both functions are the converter's, of the stages they are set as.
-            unsafe {
-                md.setMeshFunction(Some(&vf));
-                md.setFragmentFunction(ff.as_deref());
-            }
-            color_attachments(&md.colorAttachments(), d);
-            if let Some(f) = d.depth {
-                md.setDepthAttachmentPixelFormat(pixel_format(f));
-                if has_stencil {
-                    md.setStencilAttachmentPixelFormat(pixel_format(f));
+        // A mesh producer comes described (`d.mesh`, with an optional amplification stage: a
+        // stream pipeline's stages) or as the stage in `d.vs` (a guessed vertex program that
+        // exports primitives, translated as a mesh shader). Both are made by `mesh_pipeline`.
+        let guessed;
+        let mut vertex = None;
+        let mesh_desc = match &d.mesh {
+            Some(ms) => Some(ms),
+            None => {
+                let (stage, vf) = self.stage_function(d.vs, d.vs_layout, false)?;
+                if stage == crate::msc::STAGE_MESH {
+                    guessed = MeshPipelineDesc {
+                        mesh: d.vs,
+                        layout: d.vs_layout,
+                        amplification: None,
+                        amplification_layout: None,
+                        more: &[],
+                    };
+                    Some(&guessed)
+                } else {
+                    vertex = Some(vf);
+                    None
                 }
             }
-            let crash_key = crash_key(d);
-            let pso = match &self.archive {
-                Some(a) => a.mesh(&self.dev, &md, &crash_key),
-                None => crate::archive::compile_mesh(&self.dev, &md, &crash_key),
-            }?;
-            (pso, Some(size([x as usize, y as usize, z as usize])))
-        } else {
-            (self.vertex_pipeline(d, &vf, ff.as_deref())?, None)
+        };
+        let (pso, mesh) = match (mesh_desc, vertex) {
+            (Some(ms), _) => {
+                let (pso, mut dispatch) = self.mesh_pipeline(d, ms)?;
+                // The further passes of a split mesh program: the same pipeline of another
+                // mesh function. Any of them failing fails the pipeline: a share of the
+                // primitives alone must never be drawn.
+                for pass in ms.more {
+                    let pass = MeshPipelineDesc { mesh: pass, more: &[], ..*ms };
+                    let (state, other) = self.mesh_pipeline(d, &pass)?;
+                    if (other.threads, other.object_threads) != (dispatch.threads, dispatch.object_threads) {
+                        return Err("the passes of a split mesh program differ in their thread groups".into());
+                    }
+                    dispatch.more.push(state);
+                }
+                (pso, Some(dispatch))
+            }
+            (None, Some(vf)) => {
+                let ff = d.ps.map(|ps| self.stage_function(ps, d.ps_layout, d.needs_dual_source()).map(|f| f.1)).transpose()?;
+                (self.vertex_pipeline(d, &vf, ff.as_deref())?, None)
+            }
+            (None, None) => unreachable!("a vertex function or a mesh stage"),
         };
         Ok((pso, mesh))
     }
@@ -1799,6 +2354,9 @@ impl crate::metal::Compiler {
             if d.depth == Some(Format::D32FloatS8) {
                 pd.setStencilAttachmentPixelFormat(pixel_format(f));
             }
+        }
+        if d.color.is_empty() && d.depth.is_none() {
+            pd.setRasterSampleCount(targetless_samples(&self.dev));
         }
         let crash_key = crash_key(d);
         match &self.archive {
@@ -1914,9 +2472,62 @@ fn flights() -> std::sync::MutexGuard<'static, std::collections::VecDeque<Flight
     FLIGHTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+impl Metal {
+    /// Keeps `resources` and `views` that a heap let go until every command buffer made before
+    /// now has finished ([`Self::let_go_of_done`]). Without that, a texture view or a span buffer
+    /// reached only through a heap entry (and the residency set, which retains nothing) was freed
+    /// while queued work could still read it: freeing such a texture in flight faults the GPU.
+    pub(crate) fn keep_until_done(&self, resources: Vec<Res>, views: Vec<TextureObject>) {
+        if resources.is_empty() && views.is_empty() {
+            return;
+        }
+        let mark = work_mark();
+        let mut kept = self.kept_until_done.borrow_mut();
+        match kept.back_mut() {
+            Some((m, r, v)) if *m == mark => {
+                r.extend(resources);
+                v.extend(views);
+            }
+            _ => kept.push_back((mark, resources, views)),
+        }
+    }
+
+    /// Lets go of what [`Self::keep_until_done`] kept once the work made before it has finished.
+    pub(crate) fn let_go_of_done(&self) {
+        let mut kept = self.kept_until_done.borrow_mut();
+        // Marks only grow: the oldest goes first.
+        while kept.front().is_some_and(|(mark, ..)| work_done(*mark)) {
+            kept.pop_front();
+        }
+    }
+}
+
+/// The serial the next command buffer takes: every command buffer made before this call has a
+/// smaller one (`ComputeBackend::work_mark`).
+pub(crate) fn work_mark() -> u64 {
+    SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether Metal has reported on every committed command buffer with a serial below `mark`
+/// (completed, failed, or paid as lost). A command buffer is made and committed on the thread
+/// that asks, so none below `mark` is still being encoded.
+pub(crate) fn work_done(mark: u64) -> bool {
+    flights().iter().all(|f| f.serial >= mark)
+}
+
 /// Metal reported on command buffer `serial` of `queue` (completed, or `failed`).
 fn landed(serial: u64, queue: usize, failed: bool) {
     flights().retain(|f| f.serial != serial);
+    if let Some(pipes) = CB_PIPES.lock().unwrap_or_else(|e| e.into_inner()).remove(&serial)
+        && failed
+    {
+        FAILED_PIPES.lock().unwrap_or_else(|e| e.into_inner()).push((serial, pipes));
+    }
+    if let Some(fills) = CB_FILLS.lock().unwrap_or_else(|e| e.into_inner()).remove(&serial)
+        && failed
+    {
+        FAILED_FILLS.lock().unwrap_or_else(|e| e.into_inner()).push((serial, fills));
+    }
     if failed {
         let mut failures = FAILURES.lock().unwrap_or_else(|e| e.into_inner());
         match failures.iter_mut().find(|(q, ..)| *q == queue) {
@@ -1998,6 +2609,53 @@ pub(crate) fn track_event(
     event
 }
 
+/// A residency mutation holds a read guard through its commit. Terminal cleanup holds the
+/// write guard while emptying sets, then forbids changes against their obsolete membership.
+/// The title lock still serializes ordinary changes to a given heap or pool set.
+pub(crate) struct ResidencyGate(std::sync::RwLock<bool>);
+pub(crate) static RESIDENCY: ResidencyGate = ResidencyGate(std::sync::RwLock::new(true));
+
+impl ResidencyGate {
+    pub(crate) fn changes(&self) -> Option<std::sync::RwLockReadGuard<'_, bool>> {
+        let guard = self.0.read().unwrap_or_else(|e| e.into_inner());
+        (*guard).then_some(guard)
+    }
+
+    fn stop(&self) -> std::sync::RwLockWriteGuard<'_, bool> {
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        *guard = false;
+        guard
+    }
+}
+
+#[cfg(test)]
+mod residency_gate_tests {
+    use super::ResidencyGate;
+    use std::sync::{RwLock, mpsc};
+    use std::time::Duration;
+
+    #[test]
+    fn shutdown_waits_for_the_pending_commit_and_rejects_later_changes() {
+        let gate = ResidencyGate(RwLock::new(true));
+        let pending = gate.changes().expect("a running set accepts changes");
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (emptied_tx, emptied_rx) = mpsc::channel();
+            let gate = &gate;
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let _stopped = gate.stop();
+                emptied_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert_eq!(emptied_rx.recv_timeout(Duration::from_millis(20)), Err(mpsc::RecvTimeoutError::Timeout));
+            drop(pending);
+            emptied_rx.recv_timeout(Duration::from_secs(5)).expect("cleanup follows the commit");
+        });
+        assert!(gate.changes().is_none(), "emptied sets cannot use their old membership again");
+    }
+}
+
 /// The process's residency sets (each heap's and the pool's), weakly, so a stop can give back what
 /// they hold before the process exits ([`stop_gpu`]).
 struct TrackedSets(Vec<objc2::rc::Weak<ProtocolObject<dyn MTLResidencySet>>>);
@@ -2058,6 +2716,7 @@ pub fn stop_gpu(wait: std::time::Duration, longest: std::time::Duration) -> (usi
     // Then what the residency sets keep resident is given back before the process goes, not left
     // to the driver's teardown: a run that hung the GPU at world entry with ~16 GB in its heaps'
     // sets left 19.7 GB "in use" after it exited (#357). Process exit skips `Heap`'s `Drop`.
+    let _stopped = RESIDENCY.stop();
     let sets: Vec<_> = SETS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2261,6 +2920,14 @@ impl Metal {
     /// The commit line of [`commits_traced`]: this command buffer's encoders, which are then
     /// forgotten so the next piece lists only its own.
     fn trace_commit(&self, serial: u64, queue_id: usize, what: &str) {
+        if self.gate_stats.is_some() {
+            let pipes = std::mem::take(&mut *self.cb_pipes.borrow_mut());
+            CB_PIPES.lock().unwrap_or_else(|e| e.into_inner()).insert(serial, pipes);
+            let fills = std::mem::take(&mut *self.cb_fills.borrow_mut());
+            if !fills.is_empty() {
+                CB_FILLS.lock().unwrap_or_else(|e| e.into_inner()).insert(serial, fills);
+            }
+        }
         if commits_traced() {
             let enc = std::mem::take(&mut *self.trace_enc.borrow_mut()).join(" | ");
             tracing::warn!("cb commit #{serial} q{queue_id:x} t={:.3} {what} | {enc}", crate::metal::since_start());
@@ -2278,6 +2945,7 @@ impl Metal {
             BlitOp::CopyTexture { size, .. } => !size.contains(&0),
             BlitOp::CopyBufferToTexture { len, size, .. }
             | BlitOp::CopyTextureToBuffer { len, size, .. } => *len > 0 && !size.contains(&0),
+            BlitOp::CopyDepthPlane { size, row_pitch, .. } => !size.contains(&0) && *row_pitch > 0,
         };
         if !ops.iter().any(nonzero) {
             return Ok(());
@@ -2344,6 +3012,15 @@ impl Metal {
                 }
                 BlitOp::Fill { dst, len, value } => {
                     let o = off(dst.0, dst.1);
+                    if self.gate_stats.is_some() {
+                        let note = self.fill_notes.borrow_mut().remove(&(dst.1 as usize)).unwrap_or_default();
+                        self.cb_fills.borrow_mut().push(format!(
+                            "[{note}; buffer {:#x} len {:#x} pool {} off {o:#x} n {len} value {value:#x}]",
+                            dst.0.base as usize,
+                            dst.0.buf.length(),
+                            dst.0.pool,
+                        ));
+                    }
                     e.fillBuffer_range_value(&dst.0.buf, NSRange::new(o, *len), *value);
                 }
                 BlitOp::CopyTexture {
@@ -2435,6 +3112,63 @@ impl Metal {
                             *dst_mip,
                             origin(*dst_origin),
                         )
+                    };
+                }
+                BlitOp::CopyDepthPlane { texture, stencil, to_texture, buffer, size: sz, row_pitch } => {
+                    let format = texture.tex.pixelFormat();
+                    let combined = format == MTLPixelFormat::Depth32Float_Stencil8;
+                    let texel = match (format, *stencil) {
+                        (MTLPixelFormat::Depth32Float_Stencil8, true) => 1,
+                        (MTLPixelFormat::Depth32Float_Stencil8 | MTLPixelFormat::Depth32Float, false) => 4,
+                        (MTLPixelFormat::Depth16Unorm, false) => 2,
+                        _ => continue,
+                    };
+                    let at = off(buffer.0, buffer.1);
+                    if sz[0] > texture.tex.width()
+                        || sz[1] > texture.tex.height()
+                        || *row_pitch < sz[0] * texel
+                        || *row_pitch % texel != 0
+                        || at % 4 != 0
+                        || at.saturating_add(row_pitch * sz[1]) > buffer.0.buf.length()
+                    {
+                        continue;
+                    }
+                    let options = match (combined, *stencil) {
+                        (false, _) => MTLBlitOption::None,
+                        (true, false) => MTLBlitOption::DepthFromDepthStencil,
+                        (true, true) => MTLBlitOption::StencilFromDepthStencil,
+                    };
+                    let whole = size([sz[0], sz[1], 1]);
+                    // SAFETY: the region lies in level 0 of the texture and the rows in the buffer
+                    // (checked above); the options name the plane of a combined format.
+                    unsafe {
+                        if *to_texture {
+                            e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
+                                &buffer.0.buf,
+                                at,
+                                *row_pitch,
+                                row_pitch * sz[1],
+                                whole,
+                                &texture.tex,
+                                0,
+                                0,
+                                origin([0, 0, 0]),
+                                options,
+                            )
+                        } else {
+                            e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                                &texture.tex,
+                                0,
+                                0,
+                                origin([0, 0, 0]),
+                                whole,
+                                &buffer.0.buf,
+                                at,
+                                *row_pitch,
+                                row_pitch * sz[1],
+                                options,
+                            )
+                        }
                     };
                 }
                 BlitOp::CopyBufferToTexture {
@@ -2534,6 +3268,79 @@ impl Metal {
     }
 }
 
+/// Words of the `VICTORY_TRACE_GATE` buffer: groups, pipeline and the three record words of the
+/// largest dispatch record a gate let run, then the same of the largest it stopped.
+pub(crate) const GATE_STATS_WORDS: usize = 10;
+
+/// `VICTORY_TRACE_GATE=1`: the pipelines (low pointer bits) and group counts of the dispatches and
+/// indirect dispatches (groups 0) of each command buffer in flight, by serial; a failed one's move
+/// to [`FAILED_PIPES`] and are logged by name at the next submission.
+static CB_PIPES: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<CbDispatch>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static FAILED_PIPES: std::sync::Mutex<Vec<(u64, Vec<CbDispatch>)>> = std::sync::Mutex::new(Vec::new());
+/// `VICTORY_TRACE_GATE=1`: the fills of each command buffer in flight (what the host said they
+/// write, and the buffer, offset and length encoded), by serial; a failed one's move to
+/// [`FAILED_FILLS`] and are logged at the next submission.
+static CB_FILLS: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<String>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static FAILED_FILLS: std::sync::Mutex<Vec<(u64, Vec<String>)>> = std::sync::Mutex::new(Vec::new());
+/// A dispatch of [`CB_PIPES`]: the pipeline's low pointer bits and the group counts.
+pub(crate) type CbDispatch = (u32, [u32; 3]);
+
+impl Metal {
+    /// `VICTORY_TRACE_GATE=1`: once a second, the largest dispatch record the gates let run and the
+    /// largest they stopped since the last line (a dispatch or a mesh dispatch, by group count),
+    /// with its pipeline; then both are cleared.
+    fn log_gate_stats(&self) {
+        let Some((stats, last)) = &self.gate_stats else { return };
+        let failed = std::mem::take(&mut *FAILED_PIPES.lock().unwrap_or_else(|e| e.into_inner()));
+        if !failed.is_empty() {
+            let names = self.pipe_names.borrow();
+            for (serial, pipes) in failed {
+                let list: Vec<String> = pipes
+                    .iter()
+                    .map(|(id, g)| {
+                        let n = names.iter().find(|(k, _)| **k as u32 == *id).map_or_else(|| format!("{id:#x}"), |(_, n)| n.clone());
+                        format!("{n} {g:?}")
+                    })
+                    .collect();
+                tracing::warn!("gate: failed command buffer #{serial} ran {} dispatches: {}", list.len(), list.join("; "));
+            }
+        }
+        for (serial, fills) in std::mem::take(&mut *FAILED_FILLS.lock().unwrap_or_else(|e| e.into_inner())) {
+            tracing::warn!("gate: failed command buffer #{serial} held {} fills: {}", fills.len(), fills.join(" "));
+        }
+        let now = crate::metal::since_start();
+        if now - last.get() < 1.0 {
+            return;
+        }
+        last.set(now);
+        let p = stats.contents().as_ptr().cast::<u32>();
+        // SAFETY: a shared buffer of `GATE_STATS_WORDS` words; the GPU's racing writes are atomic.
+        let w: Vec<u32> = (0..GATE_STATS_WORDS).map(|k| unsafe { p.add(k).read_volatile() }).collect();
+        // SAFETY: as above.
+        unsafe { std::ptr::write_bytes(p, 0, GATE_STATS_WORDS) };
+        let names = self.pipe_names.borrow();
+        let name = |id: u32| {
+            names
+                .iter()
+                .find(|(k, _)| **k as u32 == id)
+                .map_or_else(|| format!("{id:#x}"), |(_, n)| n.clone())
+        };
+        if w[0] != 0 || w[5] != 0 {
+            tracing::info!(
+                "gate: largest run {} groups {} {:?}; largest stopped {} groups {} {:?}",
+                w[0],
+                name(w[1]),
+                &w[2..5],
+                w[5],
+                if w[5] != 0 { name(w[6]) } else { String::new() },
+                &w[7..10]
+            );
+        }
+    }
+}
+
 /// The blit option a copy between `t` and buffer rows takes: a depth and stencil texture's rows
 /// are its depth plane.
 fn depth_plane(t: &Texture) -> MTLBlitOption {
@@ -2545,6 +3352,16 @@ fn depth_plane(t: &Texture) -> MTLBlitOption {
 pub fn direct_copy(a: Format, b: Format) -> bool {
     let plain = |f: Format| f.block().0 == 1 && !f.is_depth();
     a == b || (plain(a) && plain(b) && a.block() == b.block())
+}
+
+/// The same mapping as GATE: starts align to a rectangle boundary. The shader divides the
+/// converted SV_VertexID by six; the converter subtracts the doubled start from Metal's ID,
+/// preserving ordinary draws' relative IDs. Keep instance count/base in their original units.
+fn rectangle_arguments([vertices, instances, first, instance]: [u32; 4]) -> Option<[u32; 4]> {
+    let vertices = (vertices / 3).checked_mul(6)?;
+    let start = first.checked_mul(2)?;
+    start.checked_add(vertices)?;
+    (first.is_multiple_of(3)).then_some([vertices, instances, start, instance])
 }
 
 /// `ExecuteIndirect` with a count buffer runs record `index` only while `index < count`, both read
@@ -2572,12 +3389,27 @@ using namespace metal;
 kernel void gate(device const uint *count [[buffer(20)]],
                  device const uint *record [[buffer(21)]],
                  device uint *out [[buffer(22)]],
-                 constant uint4 &at [[buffer(23)]]) {
+                 constant uint4 &at [[buffer(23)]],
+                 constant uint4 &trace [[buffer(24)]],
+                 device atomic_uint *stats [[buffer(25)]]) {
     bool run = at.z == 0u || at.x < count[0];
     if (at.w == 2u) {
         // Two steps: the product of three words does not fit 64 bits.
         ulong plane = ulong(record[0]) * record[1];
         run = run && plane <= 4194304ul && plane * record[2] <= 4194304ul;
+        // `VICTORY_TRACE_GATE`: the largest record run (words 0-4: groups, pipeline, record) and
+        // stopped (5-9), by groups capped at 2^32 - 1; racing writers may mix two records' words.
+        if (trace.x != 0u && (at.z == 0u || at.x < count[0])) {
+            ulong all = min(plane, 0xfffffffful) * record[2];
+            uint groups = uint(min(all, 0xfffffffful));
+            uint base = run ? 0u : 5u;
+            if (atomic_fetch_max_explicit(&stats[base], groups, memory_order_relaxed) < groups) {
+                atomic_store_explicit(&stats[base + 1u], trace.y, memory_order_relaxed);
+                for (uint w = 0; w < 3u; w++) {
+                    atomic_store_explicit(&stats[base + 2u + w], record[w], memory_order_relaxed);
+                }
+            }
+        }
     } else if (at.w == 1u) {
         // A rectangle a vertex triple.
         run = run && record[0] <= (3u << 20);
@@ -2595,6 +3427,12 @@ kernel void gate(device const uint *count [[buffer(20)]],
         out[1] = run && record[1] == 1u ? record[0] / 3u : 0u;
         out[2] = 0u;
         out[3] = run ? record[2] / 3u : 0u;
+    } else if (at.w == 3u) {
+        ulong vertices = ulong(out[0] / 3) * 6;
+        ulong first = ulong(out[2]) * 2;
+        bool fits = vertices + first <= 0xfffffffful && out[2] % 3 == 0;
+        out[0] = fits ? uint(vertices) : 0u;
+        out[2] = fits ? uint(first) : 0u;
     }
 }
 "#;
@@ -2635,6 +3473,7 @@ impl Metal {
         words: u32,
         kind: u32,
         set_on_queue: bool,
+        pipe: u32,
     ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, String> {
         let out = self
             .dev
@@ -2652,6 +3491,9 @@ impl Metal {
             if self.names(b, set_on_queue) {
                 e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
             }
+        }
+        if let Some((stats, _)) = &self.gate_stats {
+            e.useResource_usage(ProtocolObject::from_ref(&**stats), MTLResourceUsage::Read | MTLResourceUsage::Write);
         }
         // What the work before wrote (the count, the record) is seen.
         e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
@@ -2672,8 +3514,13 @@ impl Metal {
                 16,
                 23,
             );
+            let trace = [u32::from(self.gate_stats.is_some()), pipe, 0, 0];
+            e.setBytes_length_atIndex(NonNull::new(trace.as_ptr().cast_mut().cast()).unwrap(), 16, 24);
+            // Without the trace the kernel never touches it: the gate's own buffer stands in.
+            e.setBuffer_offset_atIndex(Some(self.gate_stats.as_ref().map_or(&*out, |(b, _)| &**b)), 0, 25);
         }
         e.dispatchThreadgroups_threadsPerThreadgroup(size([1, 1, 1]), size([1, 1, 1]));
+        frame_time::count(Metric::Dispatches, 1);
         e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         Ok(out)
     }
@@ -2715,7 +3562,7 @@ impl Metal {
             let gated = match d.indirect {
                 // An open encoder left behind makes Metal abort at the next pass's encoder.
                 Some(record) => Some(
-                    self.encode_gate(&e, d.count, record, 3, 2, set_on_queue)
+                    self.encode_gate(&e, d.count, record, 3, 2, set_on_queue, Retained::as_ptr(&d.pipeline.0) as *const u8 as usize as u32)
                         .inspect_err(|_| e.endEncoding())?,
                 ),
                 None => None,
@@ -2724,6 +3571,10 @@ impl Metal {
                 let k = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize;
                 let name = self.pipe_names.borrow().get(&k).cloned().unwrap_or_else(|| format!("{k:#x}"));
                 self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, 3));
+            }
+            if self.gate_stats.is_some() {
+                let id = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize as u32;
+                self.cb_pipes.borrow_mut().push((id, if d.indirect.is_some() { [0; 3] } else { d.groups.map(|g| g as u32) }));
             }
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
@@ -2747,6 +3598,7 @@ impl Metal {
                 },
                 None => e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group)),
             }
+            frame_time::count(Metric::Dispatches, 1);
         }
         if let Some((f, started)) = order {
             e.updateFence(f);
@@ -2829,6 +3681,8 @@ impl Metal {
         let scratch = Texture {
             tex: self.dev.newTextureWithDescriptor(&td).ok_or("no rectangular clear texture")?,
             format: target.format,
+            present_view: Default::default(),
+            views: Default::default(),
         };
         self.encode_render(
             cb,
@@ -2886,22 +3740,47 @@ impl Metal {
             samples = Some(n);
             rt_size = (rt_size.0.min(t.width()), rt_size.1.min(t.height()));
         }
-        if rp.color.is_empty() && rp.depth.is_none() {
-            // The title drew with no render targets. D3D12 runs it (it writes nothing visible);
-            // Metal needs an attachment to make an encoder, and Metal refuses one without. The
-            // pass is skipped rather than refused, so the rest of the submission still runs.
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
+        // The title drew with no render targets: its pixel shaders write through unordered access
+        // views alone (the lighting's light masks are rasterized so). Metal runs such a pass
+        // given its extent and sample count in place of attachments; the extent is what the
+        // draws' viewports cover (D3D12 has no other bound either).
+        let targetless = rp.color.is_empty() && rp.depth.is_none();
+        if targetless {
+            const LARGEST: f32 = 16384.0;
+            let extent = rp
+                .draws
+                .iter()
+                .filter(|d| d.pipeline.targetless)
+                .filter_map(|d| d.state.viewport)
+                .filter(|v| v.width > 0.0 && v.height > 0.0 && v.x >= 0.0 && v.y >= 0.0)
+                .map(|v| ((v.x + v.width).min(LARGEST).ceil() as usize, (v.y + v.height).min(LARGEST).ceil() as usize))
+                .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1)));
+            let Some(extent) = extent else {
+                // No draw of a pipeline made for such a pass, or none with a viewport: nothing
+                // says where to draw. Skipped rather than refused: the submission's rest runs.
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!("metal: a pass with no render targets and no viewport is skipped ({} draws)", rp.draws.len());
+                });
+                return Ok(());
+            };
+            rt_size = extent;
+            // Said at each power of two: whether a title's passes of this kind run, and how big.
+            static RAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = RAN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
                 eprintln!(
-                    "metal: a pass with no render targets is skipped ({} draws, writes nothing)",
-                    rp.draws.len()
+                    "metal: passes without render targets so far: {n} (this one {}x{}, {} samples, {} draws)",
+                    extent.0, extent.1, targetless_samples(&self.dev), rp.draws.len()
                 );
-            });
-            return Ok(());
+            }
         }
         let desc = MTLRenderPassDescriptor::new();
         desc.setRenderTargetWidth(rt_size.0);
         desc.setRenderTargetHeight(rt_size.1);
+        if targetless {
+            desc.setDefaultRasterSampleCount(targetless_samples(&self.dev));
+        }
         for (i, c) in rp.color.iter().enumerate() {
             // SAFETY: colour attachment index below 8.
             let a = unsafe { desc.colorAttachments().objectAtIndexedSubscript(i) };
@@ -2940,11 +3819,12 @@ impl Metal {
                 let kind = match d.call {
                     DrawCall::Rects => 1,
                     DrawCall::Mesh { .. } => 2,
+                    _ if d.topology == Topology::Rectangles => 3,
                     _ => 0,
                 };
                 gates.push(match d.indirect {
                     Some(record) if gated(d) => {
-                        let g = self.encode_gate(&c, d.count, record, words, kind, set_on_queue).inspect_err(|_| c.endEncoding())?;
+                        let g = self.encode_gate(&c, d.count, record, words, kind, set_on_queue, Retained::as_ptr(&d.pipeline.pso) as *const u8 as usize as u32).inspect_err(|_| c.endEncoding())?;
                         if self.trace_fails {
                             let name = format!("{} {}", if kind == 2 { "mesh draw" } else { "draw" }, gates.len());
                             self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, words as usize));
@@ -3009,9 +3889,9 @@ impl Metal {
         let mut default_depth = None;
         for (k, d) in rp.draws.iter().enumerate() {
             // The stage that reads the draw's buffers before the pixel shader.
-            let first = match (d.pipeline.mesh, d.call) {
-                (Some(_), DrawCall::Mesh { .. }) => MTLRenderStages::Mesh,
-                (None, DrawCall::Arrays { .. } | DrawCall::Indexed { .. } | DrawCall::Rects) => MTLRenderStages::Vertex,
+            let first = match (d.pipeline.mesh.is_some(), d.call) {
+                (true, DrawCall::Mesh { .. }) => MTLRenderStages::Mesh,
+                (false, DrawCall::Arrays { .. } | DrawCall::Indexed { .. } | DrawCall::Rects) => MTLRenderStages::Vertex,
                 _ => {
                     static ONCE: std::sync::Once = std::sync::Once::new();
                     ONCE.call_once(|| eprintln!("metal: a mesh draw of a vertex pipeline, or the reverse, is dropped"));
@@ -3021,8 +3901,19 @@ impl Metal {
             if d.indirect.is_none() && empty_draw(&d.call) {
                 continue;
             }
+            // A pipeline runs in the kind of pass it was made for: Metal faults a pipeline with
+            // target formats in a pass without attachments, and the reverse.
+            if d.pipeline.targetless != targetless {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| eprintln!("metal: a draw whose pipeline and pass disagree about having targets is dropped"));
+                continue;
+            }
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(h, attached_heaps, |set| cb.useResidencySet(set));
+            }
+            if d.topology == Topology::Rectangles && !matches!(d.call, DrawCall::Arrays { .. }) {
+                e.endEncoding();
+                return Err("rectangle output expansion requires a non-indexed draw".into());
             }
             e.setRenderPipelineState(&d.pipeline.pso);
             e.setCullMode(d.pipeline.cull);
@@ -3107,13 +3998,45 @@ impl Metal {
                 continue;
             }
             e.setScissorRect(scissor);
-            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline, &mut named);
+            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), d.object_root.as_ref(), &d.heaps, d.pipeline, &mut named);
+            let producer = producer_stages(d.pipeline.mesh.as_ref());
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage_stages(
                     ProtocolObject::from_ref(&*b.buf),
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
-                    first | MTLRenderStages::Fragment,
+                    producer | MTLRenderStages::Fragment,
                 );
+            }
+            if let (DrawCall::Mesh { groups }, Some(m)) = (d.call, &d.pipeline.mesh) {
+                // Native DX mesh/AS grids are supplied by these Metal commands. Runtime slots
+                // 4/5 hold vertex draw / geometry-tessellation emulation parameters, not this
+                // 12-byte dispatch grid. Root arguments for mesh/object/fragment stay at slot 2.
+                let indirect = d.indirect.map(|(ab, title)| {
+                    if self.names(ab, set_on_queue) {
+                        e.useResource_usage_stages(ProtocolObject::from_ref(&*ab.buf), MTLResourceUsage::Read, producer);
+                    }
+                    match gates.get(k).and_then(Option::as_ref) {
+                        Some(g) => (&**g, 0),
+                        None => (&*ab.buf, title as usize - ab.base as usize),
+                    }
+                });
+                // A split mesh program draws once per pass, the further passes with their own
+                // state and everything else as it is set: the same groups, arguments and targets.
+                for pass in std::iter::once(None).chain(m.more.iter().map(Some)) {
+                    if let Some(state) = pass {
+                        e.setRenderPipelineState(state);
+                    }
+                    match indirect {
+                        // SAFETY: the caller resolved the complete 12-byte record in this live buffer.
+                        Some((args, at)) => unsafe {
+                            e.drawMeshThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                                args, at, m.object_threads, m.threads);
+                        },
+                        None => e.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(size3(groups), m.object_threads, m.threads),
+                    }
+                    frame_time::count(Metric::Draws, 1);
+                }
+                continue;
             }
             for &(slot, b, title) in &d.vertex_buffers {
                 let off = title as usize - b.base as usize;
@@ -3130,7 +4053,7 @@ impl Metal {
                 }
             }
             let prim = match d.topology {
-                Topology::Triangles => MTLPrimitiveType::Triangle,
+                Topology::Triangles | Topology::Rectangles => MTLPrimitiveType::Triangle,
                 Topology::TriangleStrip => MTLPrimitiveType::TriangleStrip,
                 Topology::Lines => MTLPrimitiveType::Line,
                 Topology::LineStrip => MTLPrimitiveType::LineStrip,
@@ -3155,21 +4078,10 @@ impl Metal {
                     Some(g) => (&**g, 0),
                     None => (&*ab.buf, title as usize - ab.base as usize),
                 };
-                if let (Some(threads), DrawCall::Mesh { .. }) = (d.pipeline.mesh, d.call) {
-                    // SAFETY: the record (three group counts) is inside the live buffer.
-                    unsafe {
-                        e.drawMeshThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
-                            args,
-                            at,
-                            size([1, 1, 1]),
-                            threads,
-                        )
-                    };
-                    continue;
-                }
                 // SAFETY: the record is inside the live buffer (the caller resolved it).
                 unsafe { e.setVertexBuffer_offset_atIndex(Some(args), at, DRAW_ARGUMENTS) };
                 match (d.call, d.index_buffer) {
+                    (DrawCall::Mesh { .. }, _) => unreachable!("mesh handled above"),
                     (DrawCall::Arrays { .. } | DrawCall::Rects, _) => {
                         set_index_type(&e, 0);
                         // SAFETY: as above.
@@ -3200,34 +4112,27 @@ impl Metal {
                         e.endEncoding();
                         return Err("indexed draw without an index buffer".into());
                     }
-                    (DrawCall::Mesh { .. }, _) => unreachable!("a mesh draw of a vertex pipeline"),
                 }
+                frame_time::count(Metric::Draws, 1);
                 continue;
             }
             let mut dp = [0u32; 5];
             let ib: u16;
             match d.call {
-                DrawCall::Mesh { groups } => {
-                    let threads = d.pipeline.mesh.expect("a mesh pipeline");
-                    let [x, y, z] = groups.map(|n| n as usize);
-                    e.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
-                        size([x, y, z]),
-                        size([1, 1, 1]),
-                        threads,
-                    );
-                }
+                DrawCall::Mesh { .. } => unreachable!("mesh handled above"),
                 DrawCall::Arrays {
                     vertex_count,
                     instance_count,
                     first_vertex,
                     first_instance,
                 } => {
-                    dp[..4].copy_from_slice(&[
-                        vertex_count,
-                        instance_count,
-                        first_vertex,
-                        first_instance,
-                    ]);
+                    let args = [vertex_count, instance_count, first_vertex, first_instance];
+                    let Some(args) = (if d.topology == Topology::Rectangles { rectangle_arguments(args) } else { Some(args) }) else {
+                        continue;
+                    };
+                    let [vertex_count, instance_count, first_vertex, first_instance] = args;
+                    if vertex_count == 0 { continue; }
+                    dp[..4].copy_from_slice(&args);
                     ib = 0;
                     set_draw_bytes(&e, &dp, ib);
                     // SAFETY: arguments are plain counts.
@@ -3293,6 +4198,7 @@ impl Metal {
                     };
                 }
             }
+            frame_time::count(Metric::Draws, 1);
         }
         if let Some((f, started)) = order {
             e.updateFence_afterStages(f, MTLRenderStages::Fragment);
@@ -3324,6 +4230,18 @@ impl Metal {
     }
 }
 
+fn producer_stages(mesh: Option<&MeshDispatch>) -> MTLRenderStages {
+    match mesh {
+        None => MTLRenderStages::Vertex,
+        Some(m) if m.object => MTLRenderStages::Object | MTLRenderStages::Mesh,
+        Some(_) => MTLRenderStages::Mesh,
+    }
+}
+
+fn size3(t: [u32; 3]) -> MTLSize {
+    MTLSize { width: t[0] as usize, height: t[1] as usize, depth: t[2] as usize }
+}
+
 /// Whether a direct draw has a zero vertex, index, instance or mesh-group count.
 fn empty_draw(call: &DrawCall) -> bool {
     match *call {
@@ -3336,6 +4254,124 @@ fn empty_draw(call: &DrawCall) -> bool {
         DrawCall::Mesh { groups } => groups.contains(&0),
         // Only an indirect call.
         DrawCall::Rects => true,
+    }
+}
+
+impl crate::metal::Compiler {
+    /// The pipeline state and dispatch sizes of a mesh pipeline: a described mesh stage (with an
+    /// optional amplification stage) or a guessed vertex program translated as a mesh shader.
+    /// Every mesh pipeline uses upstream's archive and compile deadline.
+    fn mesh_pipeline(
+        &self,
+        d: &RenderPipelineDesc<'_>,
+        ms: &MeshPipelineDesc<'_>,
+    ) -> Result<(Retained<ProtocolObject<dyn MTLRenderPipelineState>>, MeshDispatch), String> {
+        // Debugging (`VICTORY_DEBUG_MESH_DEPTH_ONLY=1`): mesh pipelines with a pixel stage are
+        // refused, so only depth-only mesh passes (shadows) draw, as before the mesh+pixel pairs
+        // compiled. To tell whether the main view's draws are what empties the shadow maps.
+        if d.ps.is_some() && std::env::var_os("VICTORY_DEBUG_MESH_DEPTH_ONLY").is_some() {
+            return Err("debug: mesh pipelines with a pixel stage are off".into());
+        }
+        let has_stencil = d.depth == Some(Format::D32FloatS8);
+        use victory_shader::emit::{metal_mesh_bytes, METAL_MESH_OUTPUT_BYTES};
+        let bytes = metal_mesh_bytes(ms.mesh).ok_or("mesh output footprint is unknown")?;
+        if bytes > METAL_MESH_OUTPUT_BYTES {
+            return Err(format!("mesh outputs {bytes} exceed {METAL_MESH_OUTPUT_BYTES} bytes"));
+        }
+        let (mf, info) = self.mesh_function(ms.mesh, ms.layout, false)?;
+        let pd = MTLMeshRenderPipelineDescriptor::new();
+        // SAFETY: this is the reflected mesh entry point of a converted mesh library.
+        unsafe { pd.setMeshFunction(Some(&mf)) };
+        let count = |threads: [u32; 3]| -> Result<usize, String> {
+            threads.into_iter().try_fold(1usize, |n, x| n.checked_mul(x as usize))
+                .filter(|&n| n > 0 && n <= 1024).ok_or("invalid reflected mesh threadgroup size".into())
+        };
+        if info.max_vertices == 0 || info.max_vertices > 256 || info.max_primitives > 256 {
+            return Err("invalid reflected mesh output counts".into());
+        }
+        pd.setMaxTotalThreadsPerMeshThreadgroup(count(info.threads)?);
+        let mut dispatch = MeshDispatch { threads: size3(info.threads), object_threads: size3([1; 3]), object: false, more: Vec::new() };
+        if let Some(dxil) = ms.amplification {
+            let (af, ai) = self.mesh_function(dxil, ms.amplification_layout, true)?;
+            // SAFETY: reflected amplification entry point (Metal object function).
+            unsafe { pd.setObjectFunction(Some(&af)) };
+            pd.setMaxTotalThreadsPerObjectThreadgroup(count(ai.threads)?);
+            pd.setPayloadMemoryLength(ai.payload_bytes.max(info.payload_bytes) as usize);
+            dispatch.object_threads = size3(ai.threads);
+            dispatch.object = true;
+        } else if info.payload_bytes != 0 {
+            return Err("mesh payload without an amplification stage".into());
+        }
+        if let Some(ps) = d.ps {
+            let pf = self.stage_function(ps, d.ps_layout, d.needs_dual_source())?.1;
+            // SAFETY: converted fragment function.
+            unsafe { pd.setFragmentFunction(Some(&pf)) };
+        } else {
+            // Metal requires a fragment function on every mesh pipeline, even
+            // depth-only ones (D3D12 allows none): an empty one writes nothing.
+            let lib = self
+                .dev
+                .newLibraryWithSource_options_error(
+                    &objc2_foundation::NSString::from_str("fragment void victory_no_fragment() {}"),
+                    None,
+                )
+                .map_err(|e| e.localizedDescription().to_string())?;
+            let pf = lib
+                .newFunctionWithName(&objc2_foundation::NSString::from_str("victory_no_fragment"))
+                .ok_or("the empty fragment function did not compile")?;
+            // SAFETY: a fragment function with no inputs or outputs.
+            unsafe { pd.setFragmentFunction(Some(&pf)) };
+        }
+        color_attachments(&pd.colorAttachments(), d);
+        if let Some(f) = d.depth {
+            pd.setDepthAttachmentPixelFormat(pixel_format(f));
+            if has_stencil { pd.setStencilAttachmentPixelFormat(pixel_format(f)); }
+        }
+        // The mesh output footprint goes with a failure: it says how near Metal's limit the
+        // programs are that its compiler fails on.
+        let key = mesh_crash_key(d, ms);
+        let built = match &self.archive {
+            Some(a) => a.mesh(&self.dev, &pd, &key),
+            None => crate::archive::compile_mesh(&self.dev, &pd, &key),
+        };
+        // `VICTORY_DUMP_MESH_PAIRS=<dir>`: the converted libraries and the descriptor's
+        // essentials of every mesh pipeline with a pixel stage and no amplification stage,
+        // by outcome, so that a pair Metal's compiler fails on can be built outside the game.
+        if let (Some(dir), Some(ps), None) = (std::env::var_os("VICTORY_DUMP_MESH_PAIRS"), d.ps, ms.amplification)
+            && let (Ok((mesh_lib, stage)), Ok((_, pixel_lib))) = (
+                self.msc.convert_mesh_with(ms.mesh, ms.layout, false),
+                self.msc.convert_with(ps, None, d.ps_layout, d.needs_dual_source()),
+            )
+        {
+            let id = &crate::disk::key(&[ms.mesh, ps])[..16];
+            let name = format!("{}_{id}", if built.is_ok() { "ok" } else { "fail" });
+            let dir = std::path::Path::new(&dir);
+            let colors: Vec<String> = (0..d.color.len())
+                // SAFETY: colour attachment index below 8.
+                .map(|i| unsafe { pd.colorAttachments().objectAtIndexedSubscript(i) }.pixelFormat().0.to_string())
+                .collect();
+            let meta = format!(
+                "entry {}\nthreads {}\ncolors {}\ndepth {}\nstencil {}\nbytes {bytes}\nvertices {}\nprimitives {}\nmesh_dxil {}\npixel_dxil {}\nresult {}\n",
+                stage.entry,
+                pd.maxTotalThreadsPerMeshThreadgroup(),
+                colors.join(","),
+                pd.depthAttachmentPixelFormat().0,
+                pd.stencilAttachmentPixelFormat().0,
+                info.max_vertices,
+                info.max_primitives,
+                ms.mesh.len(),
+                ps.len(),
+                built.as_ref().err().map_or("ok", String::as_str),
+            );
+            let _ = std::fs::write(dir.join(format!("{name}.mesh.metallib")), mesh_lib);
+            let _ = std::fs::write(dir.join(format!("{name}.pixel.metallib")), pixel_lib);
+            let _ = std::fs::write(dir.join(format!("{name}.mesh.dxil")), ms.mesh);
+            let _ = std::fs::write(dir.join(format!("{name}.pixel.dxil")), ps);
+            let _ = std::fs::write(dir.join(format!("{name}.txt")), meta);
+        }
+        let pso = built
+            .map_err(|e| format!("{e} [mesh outputs {bytes} of {METAL_MESH_OUTPUT_BYTES} bytes, {} vertices, {} primitives, pixel stage {}]", info.max_vertices, info.max_primitives, d.ps.is_some()))?;
+        Ok((pso, dispatch))
     }
 }
 
@@ -3373,6 +4409,84 @@ fn is_depth(f: MTLPixelFormat) -> bool {
         MTLPixelFormat::Depth32Float_Stencil8,
     ]
     .contains(&f)
+}
+
+#[cfg(test)]
+mod compile_tests {
+    use super::*;
+    use victory_backend::backend::{RootLayout, RootParam};
+
+    #[test]
+    fn pending_mesh_compile_owns_its_stages_and_layouts() {
+        let (owned, key, crash) = {
+            let mesh = vec![1, 2, 3];
+            let object = vec![4, 5, 6];
+            let pixel = vec![7, 8, 9];
+            let mesh_layout = RootLayout { params: vec![RootParam::Srv { register: 3, space: 0 }], ..Default::default() };
+            let object_layout = RootLayout { params: vec![RootParam::Uav { register: 4, space: 0 }], ..Default::default() };
+            let d = RenderPipelineDesc {
+                mesh: Some(MeshPipelineDesc {
+                    mesh: &mesh,
+                    layout: Some(&mesh_layout),
+                    amplification: Some(&object),
+                    amplification_layout: Some(&object_layout),
+                    more: &[],
+                }),
+                ps: Some(&pixel),
+                dual_source: true,
+                ..Default::default()
+            };
+            (OwnedDesc::of(&d), render_key(&d), crash_key(&d))
+        };
+        let d = owned.desc();
+        let m = d.mesh.as_ref().unwrap();
+        assert_eq!(m.mesh, &[1, 2, 3]);
+        assert_eq!(m.amplification, Some(&[4, 5, 6][..]));
+        assert_eq!(m.layout.unwrap().params, [RootParam::Srv { register: 3, space: 0 }]);
+        assert_eq!(m.amplification_layout.unwrap().params, [RootParam::Uav { register: 4, space: 0 }]);
+        assert_eq!(d.ps, Some(&[7, 8, 9][..]));
+        assert!(d.dual_source);
+        assert_eq!(render_key(&d), key);
+        assert_eq!(crash_key(&d), crash);
+    }
+
+    #[test]
+    fn mesh_compile_identity_includes_object_stages_and_layouts() {
+        let layout = RootLayout::default();
+        let changed_layout = RootLayout { bounds_checked: true, ..Default::default() };
+        let mut d = RenderPipelineDesc {
+            mesh: Some(MeshPipelineDesc {
+                mesh: &[1, 2],
+                layout: Some(&layout),
+                amplification: Some(&[3, 4]),
+                amplification_layout: Some(&layout),
+                more: &[],
+            }),
+            ..Default::default()
+        };
+        let (key, crash) = (render_key(&d), crash_key(&d));
+        d.mesh.as_mut().unwrap().mesh = &[2, 1];
+        assert_ne!(render_key(&d), key);
+        assert_ne!(crash_key(&d), crash);
+        d.mesh.as_mut().unwrap().mesh = &[1, 2];
+        // A further pass is part of the pipeline; each pass is compiled, and a compiler crash
+        // on it remembered, by itself.
+        let passes = [vec![9u8]];
+        d.mesh.as_mut().unwrap().more = &passes;
+        assert_ne!(render_key(&d), key);
+        assert_eq!(crash_key(&d), crash);
+        assert_eq!(OwnedDesc::of(&d).desc().mesh.unwrap().more, &passes[..]);
+        d.mesh.as_mut().unwrap().more = &[];
+        d.mesh.as_mut().unwrap().amplification = Some(&[4, 3]);
+        assert_ne!(render_key(&d), key);
+        assert_ne!(crash_key(&d), crash);
+        d.mesh.as_mut().unwrap().amplification = Some(&[3, 4]);
+        d.mesh.as_mut().unwrap().layout = Some(&changed_layout);
+        assert_ne!(render_key(&d), key);
+        d.mesh.as_mut().unwrap().layout = Some(&layout);
+        d.mesh.as_mut().unwrap().amplification_layout = Some(&changed_layout);
+        assert_ne!(render_key(&d), key);
+    }
 }
 
 #[cfg(test)]
@@ -3423,7 +4537,9 @@ mod render_target_tests {
             cull: MTLCullMode::None,
             raster: Raster::default(),
             stencil: false,
+            targetless: false,
             mesh: None,
+            object_static: None,
             vs_static: None,
             ps_static: None,
         };
@@ -3438,6 +4554,7 @@ mod render_target_tests {
                 state: DrawState { viewport, ..Default::default() },
                 root: RootArgs::default(),
                 fragment_root: None,
+                object_root: None,
                 heaps: Heaps::default(),
                 resources: vec![],
                 vertex_buffers: vec![],
@@ -3955,6 +5072,25 @@ mod sampler_tests {
     }
 
     #[test]
+    fn a_sampler_in_a_heap_keeps_its_id() {
+        let m = Metal::new().unwrap();
+        let desc = |min_mag| SamplerDesc {
+            min: min_mag,
+            mag: min_mag,
+            mip: Filter::Nearest,
+            address: [Address::Clamp; 3],
+            border_color: BorderColor::TransparentBlack,
+            max_anisotropy: 1,
+        };
+        let id = |s: &Sampler| resource_id(s.0.gpuResourceID());
+        // The host drops its sampler once the ID is in the heap; a later one must not take that ID.
+        let first = id(&m.create_sampler(&desc(Filter::Nearest)).unwrap());
+        let second = id(&m.create_sampler(&desc(Filter::Linear)).unwrap());
+        assert_ne!(first, second, "a freed sampler's ID was reused while a heap still names it");
+        assert_eq!(id(&m.create_sampler(&desc(Filter::Nearest)).unwrap()), first, "samplers are shared by descriptor");
+    }
+
+    #[test]
     fn heap_samplers_keep_distinct_ids_for_independent_min_and_mag_filters() {
         use MTLSamplerMinMagFilter as MetalFilter;
 
@@ -3989,6 +5125,509 @@ mod sampler_tests {
 mod heap_set_tests {
     use super::*;
 
+    /// Whether `gone` holds once the work made before has finished: other tests' command buffers
+    /// may be in flight, so this waits for them (at most 10 s).
+    fn let_go(m: &Metal, gone: impl Fn() -> bool) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            m.let_go_of_done();
+            if gone() {
+                return true;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(10) {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// A texture a heap let go is kept while a command buffer committed before is in flight (it
+    /// may still read the texture through an entry or a table copy written before), and goes once
+    /// Metal has reported on that command buffer.
+    #[test]
+    fn a_retired_texture_outlives_the_command_buffers_committed_before() {
+        let _order = FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
+        if heap.set.is_none() { return }
+        let texture = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        let weak = objc2::rc::Weak::from_retained(&texture.tex);
+        m.write_texture(&heap, 0, &texture, 0.0);
+        m.use_heap_cb(&heap, &mut Vec::new(), |_| {});
+        // A command buffer that may read the entry is committed and not yet done.
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let owed = std::sync::Arc::new(Owed::of(Vec::new(), &[], 0));
+        flights().push_back(Flight { serial, queue: 0, since: std::time::Instant::now(), owed });
+        drop(texture);
+        m.clear_entry(&heap, 0);
+        m.use_heap_cb(&heap, &mut Vec::new(), |_| {});
+        m.let_go_of_done();
+        assert!(weak.load().is_some(), "kept while the command buffer committed before runs");
+        landed(serial, 0, false);
+        assert!(let_go(&m, || weak.load().is_none()), "let go once it is done");
+    }
+
+    #[test]
+    fn raw_buffer_fast_path_matches_reference_ownership_and_residency() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let mut fast = m.create_heap(HeapKind::Resource, 8).unwrap();
+        let mut slow = m.create_heap(HeapKind::Resource, 8).unwrap();
+        fast.fast_buffers = true;
+        slow.fast_buffers = false;
+        let (a, pa) = m.host_buffer(65536).unwrap();
+        let (b, pb) = m.host_buffer(65536).unwrap();
+        for n in 0..512 {
+            let (buffer, ptr) = if n % 31 == 0 { (&b, pb) } else { (&a, pa) };
+            let index = n % 8;
+            for heap in [&fast, &slow] {
+                m.write_buffer(heap, index, buffer, ptr.wrapping_add(n * 16), 64);
+                if n % 19 == 0 { m.clear_entry(heap, index); }
+            }
+            for index in 0..8 {
+                assert_eq!(fast.capture_descriptor(index).words, slow.capture_descriptor(index).words);
+            }
+            assert_eq!(fast.allocation_counts(), slow.allocation_counts());
+            if n % 17 == 0 {
+                fast.commit_set(&m); slow.commit_set(&m);
+                assert_eq!(fast.committed(), slow.committed());
+                assert_eq!(fast.set_commits.get(), slow.set_commits.get());
+            }
+        }
+        // Many raw entries share one wrapper, as well as the allocation counted above.
+        m.write_buffer(&fast, 0, &a, pa, 64);
+        m.write_buffer(&fast, 1, &a, pa.wrapping_add(64), 64);
+        if fast.dense.is_none() { assert!(Rc::ptr_eq(&fast.refs.borrow()[&0], &fast.refs.borrow()[&1])); }
+        let id = (&*a.buf as *const ProtocolObject<dyn MTLBuffer>).cast::<()>() as usize;
+        assert_eq!((fast.entry(0).unwrap().0, fast.entry(1).unwrap().0), (id, id));
+    }
+
+    /// `VICTORY_DENSE_ENTRIES`: the slab against the reference maps, on real Metal objects and
+    /// residency sets. Same entry words, counts, typed views and dirty state after every write;
+    /// the same adds, removes, commits and committed membership at every commit.
+    #[test]
+    fn dense_ownership_matches_the_reference_maps_through_random_writes_and_commits() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        const SLOTS: [usize; 8] = [0, 1, 2, 4094, 4095, 4096, 4097, 4999];
+        let heaps = [m.create_heap_as(HeapKind::Resource, 5000, true).unwrap(), m.create_heap_as(HeapKind::Resource, 5000, false).unwrap()];
+        assert!(heaps[0].dense.is_some() && heaps[1].dense.is_none());
+        let buffers: Vec<_> = (0..3).map(|_| m.host_buffer(65536).unwrap()).collect();
+        let textures: Vec<_> = (0..3).map(|_| m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 4, 4)).unwrap()).collect();
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut removals = 0;
+        for n in 0..12_000 {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            let slot = SLOTS[seed as usize % SLOTS.len()];
+            let other = SLOTS[(seed >> 8) as usize % SLOTS.len()];
+            let (buffer, ptr) = &buffers[(seed >> 16) as usize % buffers.len()];
+            let at = ptr.wrapping_add(((seed >> 20) as usize % 64) * 256);
+            let op = (seed >> 32) % 9;
+            // A texture only the heaps keep alive: its removal is the last reference.
+            let own = (op == 8).then(|| m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap());
+            for heap in &heaps {
+                match op {
+                    0 | 1 => m.clear_entry(heap, slot),
+                    2 | 3 => m.write_buffer(heap, slot, buffer, at, 64 + (seed >> 40) as u32 % 2 * 64),
+                    4 => { m.write_typed_buffer(heap, slot, buffer, at, 1024, Format::Rgba32Uint, (seed >> 41) & 1 == 0); }
+                    5 => m.write_texture(heap, slot, &textures[(seed >> 44) as usize % textures.len()], 0.0),
+                    6 | 7 => m.write_descriptor(heap, slot, &heap.capture_descriptor(other)),
+                    _ => m.write_texture(heap, slot, own.as_ref().unwrap(), 0.0),
+                }
+            }
+            drop(own);
+            let [dense, maps] = &heaps;
+            for i in [slot, other] {
+                assert_eq!(dense.capture_descriptor(i).words, maps.capture_descriptor(i).words);
+                let (a, b) = (dense.entry(i), maps.entry(i));
+                assert_eq!(a.as_ref().map(|e| e.0), b.as_ref().map(|e| e.0));
+                match (a.and_then(|e| e.1), b.and_then(|e| e.1)) {
+                    (None, None) => {}
+                    (Some(a), Some(b)) => assert!(std::ptr::eq(&*a, &*b)),
+                    _ => panic!("typed views differ at {i}"),
+                }
+            }
+            assert_eq!(dense.allocation_counts(), maps.allocation_counts());
+            assert_eq!((dense.named_entries(), dense.named_allocations()), (maps.named_entries(), maps.named_allocations()));
+            assert_eq!(dense.typed_views.get(), maps.typed_views.get());
+            assert_eq!(dense.dirty.get(), maps.dirty.get(), "write {n}");
+            assert_eq!(dense.set_commits.get(), maps.set_commits.get(), "write {n}");
+            if n % 13 == 0 {
+                let calls = heaps.each_ref().map(|heap| {
+                    let before = set_calls(&m);
+                    m.use_heap_cb(heap, &mut Vec::new(), |_| {});
+                    let after = set_calls(&m);
+                    assert_set_matches(heap);
+                    (after.0 - before.0, after.1 - before.1)
+                });
+                assert_eq!(calls[0], calls[1], "write {n}");
+                removals += calls[0].1;
+                assert_eq!(dense.committed(), maps.committed());
+                assert_eq!(dense.set_commits.get(), maps.set_commits.get());
+            }
+        }
+        assert!(removals > 50, "the sequence must commit removals: {removals}");
+    }
+
+    /// Coordinator/GPU companion to residency::tests: the same transitions through actual
+    /// descriptor snapshots, retained Metal objects, and MTLResidencySet membership.
+    #[test]
+    fn prepared_descriptors_preserve_words_and_random_residency() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 37).unwrap();
+        let (a, pa) = m.host_buffer(65536).unwrap();
+        let (b, pb) = m.host_buffer(65536).unwrap();
+        let texture = m.create_texture(&TextureDesc { mips: 4, ..TextureDesc::d2(Format::Rgba8Unorm, 16, 16) }).unwrap();
+        let view = m.create_texture_view(&texture, &ViewDesc { format: Format::Rgba8UnormSrgb, mips: (1, 2), slices: (0, 1) }).unwrap();
+        m.write_buffer(&heap, 0, &a, pa, 64);
+        m.write_buffer(&heap, 1, &a, pa.wrapping_add(32), 256);
+        m.write_buffer(&heap, 2, &b, pb, 128);
+        m.write_typed_buffer(&heap, 3, &a, pa, 256, Format::R32Uint, true);
+        m.write_texture(&heap, 4, &texture, 0.0);
+        m.write_texture(&heap, 5, &view, 1.0);
+        m.clear_entry(&heap, 6);
+        let entries: Vec<_> = (0..7).map(|i| heap.capture_descriptor(i)).collect();
+        let mut seed = 0x243f6a8885a308d3u64;
+        for n in 0..5000 {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            let slot = seed as usize % heap.count;
+            let entry = &entries[(seed >> 32) as usize % entries.len()];
+            m.write_descriptor(&heap, slot, entry);
+            assert_eq!(heap.capture_descriptor(slot).words, entry.words);
+            let mut expected = HashMap::new();
+            let mut typed = 0;
+            for (id, view) in (0..heap.count).filter_map(|i| heap.entry(i)) {
+                *expected.entry(id).or_insert(0) += 1;
+                typed += usize::from(view.is_some());
+            }
+            assert_eq!(heap.allocation_counts(), expected);
+            assert_eq!(heap.typed_views.get(), typed);
+            if n % 17 == 0 {
+                heap.commit_set(&m);
+                assert_set_matches(&heap);
+            }
+        }
+        heap.commit_set(&m);
+        assert_set_matches(&heap);
+        let samplers = m.create_heap(HeapKind::Sampler, 2).unwrap();
+        let sampler = m.create_sampler(&SamplerDesc {
+            min: Filter::Nearest, mag: Filter::Linear, mip: Filter::Nearest,
+            address: [Address::Clamp; 3], border_color: BorderColor::OpaqueWhite, max_anisotropy: 1,
+        }).unwrap();
+        m.write_sampler(&samplers, 0, &sampler, 1.25);
+        let entry = samplers.capture_descriptor(0);
+        m.clear_entry(&samplers, 0);
+        m.write_descriptor(&samplers, 1, &entry);
+        assert_eq!(samplers.capture_descriptor(1).words, entry.words);
+    }
+
+    fn assert_set_matches(heap: &Heap) {
+        let set = heap.set.as_ref().unwrap();
+        let counts = heap.allocation_counts();
+        assert_eq!(set.allocationCount(), counts.len() + 1, "includes the heap buffer");
+        assert!(set.containsAllocation(ProtocolObject::from_ref(&*heap.buf)));
+        assert_eq!(heap.committed(), counts.keys().copied().collect::<HashSet<_>>());
+        heap.each_allocation(|_, allocation| {
+            assert!(set.containsAllocation(ProtocolObject::from_ref(&**allocation)));
+        });
+        assert!(!heap.dirty.get());
+        assert_eq!(heap.pending_retired(), (0, 0));
+    }
+
+    fn set_calls(m: &Metal) -> (u64, u64) {
+        let counts = m.residency_counts();
+        (counts.set_adds, counts.set_removes)
+    }
+
+    #[test]
+    fn typed_buffer_views_are_reused_and_identical_entries_are_not_written() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 2).unwrap();
+        let (buf, ptr) = m.host_buffer(65536).unwrap();
+        m.write_typed_buffer(&heap, 0, &buf, ptr, 1024, Format::Rgba32Uint, true);
+        let first = heap.entry(0).unwrap().1.expect("a texture-buffer view");
+        let writes = m.residency_counts().entry_writes;
+        m.write_typed_buffer(&heap, 0, &buf, ptr, 1024, Format::Rgba32Uint, true);
+        assert_eq!(m.residency_counts().entry_writes, writes, "the second entry write is skipped");
+        assert!(std::ptr::eq(&*first, &*heap.entry(0).unwrap().1.unwrap()));
+        m.write_typed_buffer(&heap, 1, &buf, ptr, 1024, Format::Rgba32Uint, true);
+        assert!(std::ptr::eq(&*first, &*heap.entry(1).unwrap().1.unwrap()), "shared across entries");
+
+        // The fitted width is the same, but the descriptor's byte size is different.
+        let writes = m.residency_counts().entry_writes;
+        m.write_typed_buffer(&heap, 0, &buf, ptr, 1025, Format::Rgba32Uint, true);
+        assert!(std::ptr::eq(&*first, &*heap.entry(0).unwrap().1.unwrap()));
+        assert_eq!(m.residency_counts().entry_writes, writes + 1, "changed metadata is still written");
+        m.write_typed_buffer(&heap, 0, &buf, ptr, 1024, Format::Rgba32Uint, false);
+        assert!(!std::ptr::eq(&*first, &*heap.entry(0).unwrap().1.unwrap()), "writable usage is part of the key");
+        m.write_typed_buffer(&heap, 0, &buf, ptr, 1024, Format::Rgba32Float, true);
+        assert!(!std::ptr::eq(&*first, &*heap.entry(0).unwrap().1.unwrap()), "format is part of the key");
+    }
+
+    #[test]
+    fn texture_views_are_cached_by_the_fitted_ranges() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let texture = m.create_texture(&TextureDesc {
+            dim: TexDim::D2Array, depth_or_layers: 4, mips: 4,
+            ..TextureDesc::d2(Format::Rgba8Unorm, 32, 32)
+        }).unwrap();
+        let all = ViewDesc { format: Format::Rgba8Unorm, mips: (1, usize::MAX), slices: (1, usize::MAX) };
+        let fitted = ViewDesc { mips: (1, 3), slices: (1, 3), ..all };
+        let first = m.create_texture_view(&texture, &all).unwrap();
+        let second = m.create_texture_view(&texture, &fitted).unwrap();
+        assert!(std::ptr::eq(&*first.tex, &*second.tex));
+        let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
+        m.write_texture(&heap, 0, &first, 0.0);
+        let writes = m.residency_counts().entry_writes;
+        m.write_texture(&heap, 0, &second, 0.0);
+        assert_eq!(m.residency_counts().entry_writes, writes);
+        for other in [
+            ViewDesc { mips: (2, 2), ..fitted },
+            ViewDesc { slices: (0, 3), ..fitted },
+            ViewDesc { format: Format::Rgba8UnormSrgb, ..fitted },
+        ] {
+            let view = m.create_texture_view(&texture, &other).unwrap();
+            assert!(!std::ptr::eq(&*first.tex, &*view.tex), "distinct views must stay distinct");
+        }
+    }
+
+    #[test]
+    fn replaced_allocations_live_until_the_next_heap_use_commits_their_removal() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
+        let Some(set) = &heap.set else { return };
+        assert_set_matches(&heap);
+        let heap_only = set.allocatedSize();
+        let old = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 1024, 1024)).unwrap();
+        let old_weak = objc2::rc::Weak::from_retained(&old.tex);
+        m.write_texture(&heap, 0, &old, 0.0);
+        let mut attached = Vec::new();
+        m.use_heap_cb(&heap, &mut attached, |_| {});
+        assert_set_matches(&heap);
+        let (bytes, commits) = (set.allocatedSize(), heap.set_commits.get());
+        let (adds, removes) = set_calls(&m);
+        let new = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 16, 16)).unwrap();
+        m.write_texture(&heap, 0, &new, 0.0);
+        drop(old);
+        assert_eq!(heap.set_commits.get(), commits, "replacement must not commit");
+        assert_eq!(set.allocatedSize(), bytes, "the set still reports the last commit");
+        assert!(old_weak.load().is_some(), "the pending removal owns the last reference");
+        assert_eq!(heap.pending_retired().0, 1);
+        assert_eq!(set_calls(&m), (adds, removes), "entry edits issue no set calls");
+        m.use_heap_cb(&heap, &mut attached, |_| panic!("already attached to this command buffer"));
+        assert_eq!(heap.set_commits.get(), commits + 1);
+        assert_eq!(set_calls(&m), (adds + 1, removes + 1), "one add and one remove in one commit");
+        assert_set_matches(&heap);
+        assert_eq!(heap.pending_retired().0, 0);
+        assert!(let_go(&m, || old_weak.load().is_none()), "the committed removal releases the old texture once earlier work is done");
+        // Metal reports sizes in its own granules: a 16x16 texture may add nothing it shows.
+        assert!(set.allocatedSize() < bytes && set.allocatedSize() >= heap_only, "{} of {bytes}, heap {heap_only}", set.allocatedSize());
+        assert_eq!(set.allocationCount(), 2);
+    }
+
+    #[test]
+    fn an_allocation_removed_then_added_before_commit_stays_resident() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 2).unwrap();
+        let Some(set) = &heap.set else { return };
+        let texture = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 128, 128)).unwrap();
+        let mut attached = Vec::new();
+        m.write_texture(&heap, 0, &texture, 0.0);
+        m.use_heap_cb(&heap, &mut attached, |_| {});
+        assert_set_matches(&heap);
+        let (bytes, commits) = (set.allocatedSize(), heap.set_commits.get());
+        let calls = set_calls(&m);
+        m.clear_entry(&heap, 0);
+        m.write_texture(&heap, 1, &texture, 0.0);
+        assert_eq!(heap.set_commits.get(), commits);
+        assert_eq!(set_calls(&m), calls);
+        assert!(set.containsAllocation(ProtocolObject::from_ref(&*texture.tex)), "Metal membership was never changed");
+        m.use_heap_cb(&heap, &mut attached, |_| panic!("already attached"));
+        assert_eq!(heap.set_commits.get(), commits, "unchanged membership needs no commit");
+        assert_eq!(set_calls(&m), calls);
+        assert_set_matches(&heap);
+        assert_eq!(set.allocationCount(), 2);
+        assert_eq!(set.allocatedSize(), bytes);
+        assert_eq!(heap.pending_retired().0, 0);
+        assert!(set.containsAllocation(ProtocolObject::from_ref(&*texture.tex)));
+    }
+
+    #[test]
+    fn an_allocation_added_and_retired_before_commit_never_enters_the_set() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
+        let Some(set) = &heap.set else { return };
+        assert_set_matches(&heap);
+        let calls = set_calls(&m);
+        let commits = heap.set_commits.get();
+        let texture = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        let weak = objc2::rc::Weak::from_retained(&texture.tex);
+        m.write_texture(&heap, 0, &texture, 0.0);
+        assert!(!set.containsAllocation(ProtocolObject::from_ref(&*texture.tex)));
+        m.clear_entry(&heap, 0);
+        drop(texture);
+        assert!(weak.load().is_some(), "retirement prevents address reuse");
+        assert_eq!(set_calls(&m), calls);
+        m.use_heap_cb(&heap, &mut Vec::new(), |_| {});
+        assert_eq!(set_calls(&m), calls);
+        assert_eq!(heap.set_commits.get(), commits);
+        assert_set_matches(&heap);
+        assert!(let_go(&m, || weak.load().is_none()), "a no-op reconciliation also releases retired objects");
+    }
+
+    #[test]
+    fn alternating_entry_changes_issue_only_the_net_membership_change() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
+        let Some(set) = &heap.set else { return };
+        let texture = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        let mut attached = Vec::new();
+        assert_set_matches(&heap);
+        // Add-remove-add, then remove-add-remove, each spanning a single commit.
+        for present in [true, false] {
+            let (adds, removes) = set_calls(&m);
+            let commits = heap.set_commits.get();
+            for name in [present, !present, present] {
+                if name {
+                    m.write_texture(&heap, 0, &texture, 0.0);
+                } else {
+                    m.clear_entry(&heap, 0);
+                }
+                assert_eq!(set_calls(&m), (adds, removes));
+                assert_eq!(heap.set_commits.get(), commits);
+            }
+            m.use_heap_cb(&heap, &mut attached, |_| {});
+            assert_eq!(set_calls(&m), (adds + u64::from(present), removes + u64::from(!present)));
+            assert_eq!(heap.set_commits.get(), commits + 1);
+            assert_eq!(set.containsAllocation(ProtocolObject::from_ref(&*texture.tex)), present);
+            assert_set_matches(&heap);
+        }
+    }
+
+    #[test]
+    fn a_retired_typed_entry_keeps_both_the_buffer_and_its_view_until_commit() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
+        if heap.set.is_none() { return }
+        let (buffer, ptr) = m.host_buffer(65536).unwrap();
+        let buffer_weak = objc2::rc::Weak::from_retained(&buffer.buf);
+        m.write_typed_buffer(&heap, 0, &buffer, ptr, 1024, Format::Rgba32Uint, true);
+        let view_weak = objc2::rc::Weak::from_retained(&heap.entry(0).unwrap().1.unwrap());
+        let mut attached = Vec::new();
+        m.use_heap_cb(&heap, &mut attached, |_| {});
+        let commits = heap.set_commits.get();
+        drop(buffer); // Its cache goes too, but the entry still owns both objects.
+        m.clear_entry(&heap, 0);
+        assert_eq!(heap.pending_retired(), (1, 1));
+        assert_eq!(heap.set_commits.get(), commits);
+        assert!(buffer_weak.load().is_some() && view_weak.load().is_some());
+        m.use_heap_cb(&heap, &mut attached, |_| panic!("already attached"));
+        assert_eq!(heap.set_commits.get(), commits + 1);
+        assert_set_matches(&heap);
+        assert!(let_go(&m, || buffer_weak.load().is_none() && view_weak.load().is_none()));
+    }
+
+    #[test]
+    fn a_heap_without_command_buffers_bounds_pending_removals() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
+        let Some(set) = &heap.set else { return };
+        let textures: Vec<_> = (0..RETIRED_OBJECTS + 2)
+            .map(|_| m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap())
+            .collect();
+        m.write_texture(&heap, 0, &textures[0], 0.0);
+        let commits = heap.set_commits.get();
+        for texture in &textures[1..=RETIRED_OBJECTS] {
+            m.write_texture(&heap, 0, texture, 0.0);
+        }
+        assert_eq!(heap.set_commits.get(), commits);
+        assert_eq!(heap.pending_retired().0, RETIRED_OBJECTS);
+        m.write_texture(&heap, 0, &textures[RETIRED_OBJECTS + 1], 0.0);
+        assert_eq!(heap.set_commits.get(), commits + 1);
+        assert_eq!(heap.pending_retired().0, 0);
+        assert!(!heap.dirty.get());
+        assert_eq!(set.allocationCount(), 2);
+        assert!(set.containsAllocation(ProtocolObject::from_ref(&*textures[RETIRED_OBJECTS + 1].tex)));
+        assert_eq!(set_calls(&m), (2, 0), "only the heap buffer and final texture were added");
+        assert_set_matches(&heap);
+    }
+
+    #[test]
+    fn retired_views_also_force_reconciliation_at_the_bound() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
+        if heap.set.is_none() { return }
+        let (buffer, ptr) = m.host_buffer(65536).unwrap();
+        let commits = heap.set_commits.get();
+        let calls = set_calls(&m);
+        for _ in 0..RETIRED_OBJECTS - 1 {
+            m.write_typed_buffer(&heap, 0, &buffer, ptr, 1024, Format::Rgba32Uint, true);
+            m.clear_entry(&heap, 0);
+        }
+        assert_eq!(heap.pending_retired(), (1, RETIRED_OBJECTS - 1));
+        assert!(heap.dirty.get());
+        m.write_typed_buffer(&heap, 0, &buffer, ptr, 1024, Format::Rgba32Uint, true);
+        m.clear_entry(&heap, 0);
+        assert_set_matches(&heap);
+        assert_eq!(heap.set_commits.get(), commits, "reconciliation has no net change");
+        assert_eq!(set_calls(&m), calls);
+    }
+
+    #[test]
+    fn multiple_removals_commit_once_and_drop_detaches_before_releasing_objects() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 4).unwrap();
+        let Some(set) = heap.set.clone() else { return };
+        let mut weak = Vec::new();
+        for i in 0..4 {
+            let texture = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+            weak.push(objc2::rc::Weak::from_retained(&texture.tex));
+            m.write_texture(&heap, i, &texture, 0.0);
+        }
+        let mut attached = Vec::new();
+        m.use_heap_cb(&heap, &mut attached, |_| {});
+        assert_set_matches(&heap);
+        let commits = heap.set_commits.get();
+        let (adds, removes) = set_calls(&m);
+        for i in 0..3 {
+            m.clear_entry(&heap, i);
+        }
+        assert_eq!(set_calls(&m), (adds, removes));
+        assert!(weak.iter().all(|w| w.load().is_some()));
+        m.use_heap_cb(&heap, &mut attached, |_| panic!("already attached"));
+        assert_eq!(heap.set_commits.get(), commits + 1);
+        assert_eq!(set_calls(&m), (adds, removes + 3));
+        assert_set_matches(&heap);
+        assert!(let_go(&m, || weak[..3].iter().all(|w| w.load().is_none())));
+
+        // Drop with a committed retirement and a desired addition that Metal never saw.
+        m.clear_entry(&heap, 3);
+        let new = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        let new_weak = objc2::rc::Weak::from_retained(&new.tex);
+        m.write_texture(&heap, 0, &new, 0.0);
+        drop(new);
+        let calls = set_calls(&m);
+        drop(heap);
+        assert_eq!(set.allocationCount(), 0);
+        assert_eq!(set_calls(&m), calls, "Drop uses removeAllAllocations without reconciliation");
+        assert!(weak[3].load().is_none() && new_weak.load().is_none());
+    }
+
+    #[test]
+    fn without_sets_removed_objects_are_released_at_once() {
+        let m = Metal::new().unwrap().with_residency_sets(false);
+        let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
+        let texture = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        let weak = objc2::rc::Weak::from_retained(&texture.tex);
+        m.write_texture(&heap, 0, &texture, 0.0);
+        drop(texture);
+        assert!(weak.load().is_some());
+        m.clear_entry(&heap, 0);
+        assert!(weak.load().is_none());
+        assert_eq!(heap.pending_retired(), (0, 0));
+        assert!(heap.committed().is_empty());
+        assert_eq!(set_calls(&m), (0, 0));
+        assert_eq!(heap.set_commits.get(), 0);
+    }
+
     #[test]
     fn each_command_buffer_attaches_each_heap_once_and_commits_later_changes() {
         let m = Metal::new().unwrap().with_heap_sets();
@@ -4001,6 +5640,7 @@ mod heap_set_tests {
         let attaches = |heap: &Heap, attached_heaps: &mut Vec<*const Heap>| {
             let mut called = false;
             m.use_heap_cb(heap, attached_heaps, |_| called = true);
+            assert_set_matches(heap);
             called
         };
         let mut first = Vec::new();
@@ -4070,8 +5710,8 @@ mod heap_set_tests {
     }
 
     /// A heap's residency set holds the heap buffer and each allocation its entries name, once,
-    /// and lets an allocation go when the last entry naming it is overwritten: the set is what a
-    /// command buffer that uses the heap keeps resident.
+    /// and lets an allocation go at the next command-buffer use after its last entry is
+    /// overwritten: the set is what a command buffer that uses the heap keeps resident.
     #[test]
     fn a_heaps_set_follows_its_entries() {
         let m = Metal::new().unwrap().with_heap_sets();
@@ -4081,7 +5721,9 @@ mod heap_set_tests {
             return;
         };
         let held = || {
-            set.commit();
+            // Match production use, including releasing objects retained for pending removals.
+            m.use_heap_cb(&heap, &mut Vec::new(), |_| {});
+            assert_set_matches(&heap);
             set.allocationCount()
         };
         let texture = || m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
@@ -4195,9 +5837,7 @@ mod heap_set_tests {
         )
         .unwrap();
         let heap = m.create_heap(HeapKind::Resource, TOTAL).unwrap();
-        if let Some(set) = &heap.set {
-            set.commit();
-        }
+        heap.commit_set(&m);
 
         let fp0 = phys_footprint();
         let t0 = std::time::Instant::now();

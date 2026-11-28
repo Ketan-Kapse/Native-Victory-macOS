@@ -1,0 +1,7 @@
+// The fragment shader of mesh_limit_ms: green where all sixty interpolated components have the
+// values the mesh shader gave them, red elsewhere. No game code or data.
+bool near(float4 a, float4 b) { return all(abs(a - b) < 0.001); }
+float4 main(float4 a0 : TEXCOORD0, float4 a1 : TEXCOORD1, float4 a2 : TEXCOORD2, float4 a3 : TEXCOORD3, float4 a4 : TEXCOORD4, float4 a5 : TEXCOORD5, float4 a6 : TEXCOORD6, float4 a7 : TEXCOORD7, float4 a8 : TEXCOORD8, float4 a9 : TEXCOORD9, float4 a10 : TEXCOORD10, float4 a11 : TEXCOORD11, float4 a12 : TEXCOORD12, float4 a13 : TEXCOORD13, float4 a14 : TEXCOORD14) : SV_Target0 {
+    bool ok = near(a0, float4(0, 0 + 0.25, 0 + 0.5, 0 + 0.75)) && near(a1, float4(1, 1 + 0.25, 1 + 0.5, 1 + 0.75)) && near(a2, float4(2, 2 + 0.25, 2 + 0.5, 2 + 0.75)) && near(a3, float4(3, 3 + 0.25, 3 + 0.5, 3 + 0.75)) && near(a4, float4(4, 4 + 0.25, 4 + 0.5, 4 + 0.75)) && near(a5, float4(5, 5 + 0.25, 5 + 0.5, 5 + 0.75)) && near(a6, float4(6, 6 + 0.25, 6 + 0.5, 6 + 0.75)) && near(a7, float4(7, 7 + 0.25, 7 + 0.5, 7 + 0.75)) && near(a8, float4(8, 8 + 0.25, 8 + 0.5, 8 + 0.75)) && near(a9, float4(9, 9 + 0.25, 9 + 0.5, 9 + 0.75)) && near(a10, float4(10, 10 + 0.25, 10 + 0.5, 10 + 0.75)) && near(a11, float4(11, 11 + 0.25, 11 + 0.5, 11 + 0.75)) && near(a12, float4(12, 12 + 0.25, 12 + 0.5, 12 + 0.75)) && near(a13, float4(13, 13 + 0.25, 13 + 0.5, 13 + 0.75)) && near(a14, float4(14, 14 + 0.25, 14 + 0.5, 14 + 0.75));
+    return ok ? float4(0,1,0,1) : float4(1,0,0,1);
+}

@@ -7,22 +7,25 @@
 //! thread's console lane is its group index modulo 64 (`console_flat`, which
 //! also makes the host lane the console's). What stays inside 32 lanes is
 //! the host's own: DPP rows and quads, `ds_swizzle` (its masks keep bit 5),
-//! `ds_bpermute_b32`, `v_mbcnt`, `v_writelane`, lane-bit tests of masks held as numbers and
-//! `v_readfirstlane` (read per half: the console reads the first lane EXEC
-//! leaves on, and the translation has always read the first lane that runs,
-//! so a value that is not the same in both halves is where it differs).
+//! `ds_bpermute_b32`, `v_mbcnt`, `v_writelane`, and lane-bit tests of numeric masks.
+//! In the per-lane fast path `v_readfirstlane` reads per half, so a value that
+//! differs between halves is where it differs from a console-wide first lane.
 //!
-//! What reaches across the two halves goes through group-shared memory (the
-//! `xchg` array, one dword per thread) between two group barriers: a ballot
-//! of a mask read as data, `v_readlane_b32` and the reductions and prefixes
-//! of whole-wave sections. A ballot is each
-//! half's 32 bits, joined; a lane read is a load at the source lane's slot;
-//! a reduction is each half's result, combined; a prefix combines the lower
-//! half's total with each upper lane's prefix. Lanes the group lacks (a group
-//! whose lanes are not a multiple of 64) write no slot: their ballot bits are
-//! 0, a missing upper half adds nothing to a reduction, and a lane read of
-//! one gives 0.
+//! What reaches across halves uses group-shared memory between barriers:
+//! masks read as data, named lane reads, and whole-wave reductions. In a
+//! group of one console wave, console flow makes every thread follow the
+//! wave-wide branch while EXEC guards vector effects. This permits exchanges
+//! inside divergent console loops without placing a host barrier in divergent
+//! host control flow. Multi-wave groups retain the uniform-site restriction unless
+//! `predicate.rs` if-converts an acyclic program: all threads then visit every exchange,
+//! while wave predicates guard resource accesses and EXEC additionally guards vector work.
+//! First-lane reads in console flow and lockstep read the first set lane of
+//! the complete EXEC mask. RDNA2 `ds_bpermute_b32` stays within its own half.
 //!
+//! The `xchg` array holds one dword per thread between two group barriers.
+//! A ballot joins each half's 32 bits; a lane read loads the source lane's slot;
+//! a reduction combines the half results; a prefix combines the lower half's
+//! total with each upper lane's prefix.
 //! Group barriers need every thread of the group. Such an operation is
 //! therefore lowered only in a block each thread runs exactly once
 //! ([`once_blocks`](super::once_blocks)), or, in a group that is one console
@@ -40,9 +43,14 @@
 //! shared-memory round trip per such operation, 4 bytes per thread of
 //! group-shared memory in all, and `WaveSize(32)` in place of 64.
 //!
-//! LDS that lanes of one console wave share without a barrier (the console
-//! runs the wave in lockstep) gets the group barriers `narrow_waves` adds
-//! ([`split_wave_barriers`](super::split_wave_barriers)), or is refused.
+//! Lanes the group lacks (a group whose lanes are not a multiple of 64)
+//! write no exchange slot: their ballot bits are 0, a missing upper half
+//! adds nothing to a reduction, and a lane read of one gives 0. An SCC
+//! computed from a `v_readfirstlane` is not uniform outside console flow:
+//! each half reads its own first lane.
+//!
+//! LDS shared by one console wave gets barriers between accesses in console
+//! flow. The existing narrow-wave barrier analysis is retained elsewhere.
 
 use super::{Lower, Why};
 use crate::emit::bitcode::{Attr, Bin, V, pred};
@@ -50,6 +58,41 @@ use crate::emit::shader::flags;
 use crate::emit::wave::Op;
 
 impl Lower<'_> {
+    /// Continuation and cancellation share one packed slot and one rendezvous.
+    /// Bitwise OR preserves both votes independently; no extra shared storage.
+    pub(super) fn group_vote(&mut self, at: usize, on: V, abort: Option<V>) -> (V, Option<V>) {
+        let f = self.console_flat();
+        let index = if self.communicating {
+            let five = self.s.m.i32(5);
+            self.s.m.bin(at, Bin::LShr, f, five)
+        } else { f };
+        let slot = self.xchg_slot(at, index);
+        let mut x = self.s.m.cast(at, super::Cast::ZExt, on, self.s.t.i32);
+        if let Some(abort) = abort {
+            let bit = self.s.m.cast(at, super::Cast::ZExt, abort, self.s.t.i32);
+            let one = self.s.m.i32(1);
+            let bit = self.s.m.bin(at, Bin::Shl, bit, one);
+            x = self.s.m.bin(at, Bin::Or, x, bit);
+        }
+        self.s.m.store(at, slot, x);
+        self.xchg_barrier(at);
+        let mut any = self.s.m.i32(0);
+        let lanes = self.s.threads.unwrap().iter().product::<u32>();
+        for lane in (0..lanes).step_by(32) {
+            let lane = self.s.m.i32(if self.communicating { lane / 32 } else { lane });
+            let p = self.xchg_slot(at, lane);
+            let x = self.s.m.load(at, p);
+            any = self.s.m.bin(at, Bin::Or, any, x);
+        }
+        self.xchg_barrier(at);
+        let z = self.s.m.i32(0);
+        if abort.is_none() { return (self.s.m.cmp(at, pred::NE, any, z), None); }
+        let (one, two) = (self.s.m.i32(1), self.s.m.i32(2));
+        let active = self.s.m.bin(at, Bin::And, any, one);
+        let aborted = self.s.m.bin(at, Bin::And, any, two);
+        (self.s.m.cmp(at, pred::NE, active, z), Some(self.s.m.cmp(at, pred::NE, aborted, z)))
+    }
+
     /// A group barrier with a shared-memory fence in DXIL block `at`.
     fn xchg_barrier(&mut self, at: usize) {
         let mode = self.s.m.i32(1 | 8);
@@ -61,8 +104,8 @@ impl Lower<'_> {
     /// Whether every thread of the group (both halves of a console wave)
     /// reaches IR block `ir` together.
     fn exchange_site(&self, ir: usize) -> Result<(), Why> {
-        // In lockstep every thread reaches every block together (`lockstep.rs`).
-        if self.once[ir] || self.x.st.lockstep {
+        // Both wave-wide forms bring every thread to each exchange.
+        if self.console_cf || self.once[ir] || self.x.st.lockstep {
             return Ok(());
         }
         Err(super::DIVERGENT_EXCHANGE)
@@ -102,9 +145,120 @@ impl Lower<'_> {
         )
     }
 
+    /// Evaluate the already-proved mask BDD on pairs of scalar words. Only a
+    /// new vector predicate or a loop mask phi needs a ballot; save/restore,
+    /// intersections and uniform conditions reuse those words. Ballots live
+    /// at their atom's definition, so cached values dominate every use.
+    pub(super) fn wide_mask(&mut self, mask: super::Bool, at: usize, ir: usize) -> Result<(V, V), Why> {
+        use crate::structure::{Atom, Bool};
+        if let Some(&words) = self.numeric_masks.get(&(at, mask)) { return Ok(words); }
+        let zero = self.s.m.i32(0);
+        let ones = self.s.m.i32(u32::MAX);
+        if mask == Bool::FALSE { return Ok((zero, zero)); }
+        if mask == Bool::TRUE {
+            let lanes = self.s.threads.unwrap().iter().product::<u32>();
+            if lanes.is_multiple_of(64) { return Ok((ones, ones)); }
+            let f = self.console_flat();
+            let last = self.s.m.i32(lanes / 64 * 64);
+            let partial = self.s.m.cmp(at, pred::IUGE, f, last);
+            let count = lanes % 64;
+            let low = self.s.m.i32(u32::MAX >> (32 - count.min(32)));
+            let high = self.s.m.i32(if count > 32 { u32::MAX >> (64 - count) } else { 0 });
+            return Ok((self.s.m.select(at, partial, low, ones), self.s.m.select(at, partial, high, ones)));
+        }
+        let (atom, lo, hi) = self.x.st.bools.node(mask).expect("nonconstant mask");
+        let a = match atom {
+            Atom::Uniform(_) => {
+                let bit = self.atom(atom, at)?;
+                let word = self.s.m.select(at, bit, ones, zero);
+                (word, word)
+            }
+            Atom::Constant(bits) => (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32)),
+            _ => match self.atom_ballots.get(&atom).copied() {
+                Some(words) => words,
+                None if matches!(atom, Atom::Phi(_)) => {
+                    let Atom::Phi(v) = atom else { unreachable!() };
+                    let &(b, i) = self.phi_at.get(&v).ok_or("a mask atom without a phi")?;
+                    let head = self.block[b].ok_or("an unreachable mask atom")?;
+                    let words = (self.s.m.phi(head, self.s.t.i32), self.s.m.phi(head, self.s.t.i32));
+                    self.atom_ballots.insert(atom, words);
+                    self.pending_numeric_masks.push((words, b, i));
+                    words
+                }
+                None => {
+                    let (block, place) = match atom {
+                        Atom::Phi(v) => {
+                            let &(b, _) = self.phi_at.get(&v).ok_or("a mask atom without a phi")?;
+                            (b, self.block[b].ok_or("an unreachable mask atom")?)
+                        }
+                        Atom::Lane(v) => match self.def_block.get(&v).copied() {
+                            Some(b) if b == self.cur_ir => (b, self.cur),
+                            Some(b) => (b, self.tail[b].ok_or("a mask atom after its use")?),
+                            None => (0, self.s.entry),
+                        },
+                        // Opaque numeric values and quad masks keep the existing
+                        // materialization rules; no unproved numeric equivalence.
+                        _ => (ir, at),
+                    };
+                    let bit = self.atom(atom, place)?;
+                    let words = self.wide_ballot(place, block, bit)?;
+                    if matches!(atom, Atom::Phi(_) | Atom::Lane(_)) {
+                        self.atom_ballots.insert(atom, words);
+                    }
+                    words
+                }
+            },
+        };
+        let l = self.wide_mask(lo, at, ir)?;
+        let h = self.wide_mask(hi, at, ir)?;
+        let select = |m: &mut crate::emit::bitcode::Module, a, l, h| {
+            let difference = m.bin(at, Bin::Xor, l, h);
+            let picked = m.bin(at, Bin::And, a, difference);
+            m.bin(at, Bin::Xor, l, picked)
+        };
+        let words = (select(&mut self.s.m, a.0, l.0, h.0), select(&mut self.s.m, a.1, l.1, h.1));
+        self.numeric_masks.insert((at, mask), words);
+        Ok(words)
+    }
+
+    /// A console PC chooses one predecessor for the entire console wave, so
+    /// carry the two words through that same edge instead of re-balloting a
+    /// per-lane phi on every loop visit. Mixed mask/data joins stay refused.
+    pub(super) fn fill_numeric_masks(&mut self) -> Result<(), Why> {
+        while let Some((words, b, i)) = self.pending_numeric_masks.pop() {
+            let phi = &self.x.p.blocks[b].phis[i];
+            let high = self.pair_high(phi.value)
+                .and_then(|h| self.phi_at.get(&h))
+                .map(|&(b, i)| &self.x.p.blocks[b].phis[i]);
+            let mut incoming = [Vec::new(), Vec::new()];
+            for (n, &q) in self.x.p.blocks[b].preds.iter().enumerate() {
+                let Some(tail) = self.tail[q] else { continue };
+                let mask = self.x.st.mask_bits(phi.args[n], high.map(|h| h.args[n]))
+                    .ok_or("a register joining a lane mask and data, read as data")?;
+                let at = self.edges.get(&(q, b)).copied().unwrap_or(tail);
+                let here = (self.cur, self.cur_ir);
+                // A new ballot of a lane value `q` defines is cached for every
+                // later use, so it belongs to `q`'s own region and not to this
+                // edge's: the schedule carries a value from its region's last
+                // visit, and an edge the wave did not take holds a stale one.
+                (self.cur, self.cur_ir) = (tail, q);
+                let result = self.wide_mask(mask, at, q);
+                (self.cur, self.cur_ir) = here;
+                let (lo, hi) = result?;
+                incoming[0].push((lo, at));
+                incoming[1].push((hi, at));
+            }
+            let [lo, hi] = incoming;
+            self.s.m.set_phi(words.0, lo);
+            self.s.m.set_phi(words.1, hi);
+        }
+        Ok(())
+    }
+
     /// The console's ballot of `on` in DXIL block `at` (IR block `ir`): the
     /// low and high dwords.
     pub(super) fn wide_ballot(&mut self, at: usize, ir: usize, on: V) -> Result<(V, V), Why> {
+        let start = self.s.m.exchange_start(at);
         let (x, y) = self.host_ballot(at, on);
         if !self.halves {
             return Ok((x, y));
@@ -130,6 +284,7 @@ impl Lower<'_> {
             }
             None => hi,
         };
+        if self.synchronized { self.s.m.exchange_end(at, start); }
         Ok((lo, hi))
     }
 
@@ -190,22 +345,36 @@ impl Lower<'_> {
         }
         self.exchange_site(self.cur_ir)?;
         self.s.flags |= flags::WAVE_OPS;
+        let start = self.s.m.exchange_start(c);
         let f = self.console_flat();
-        let slot = self.xchg_slot(c, f);
-        self.s.m.store(c, slot, x);
+        // One slot per host half: every thread of it stores the same value.
+        let (slot_index, value) = if self.communicating {
+            let five = self.s.m.i32(5);
+            let low = self.s.m.bin(c, Bin::And, lane, k31);
+            let value = self.read_lane(x, low);
+            (self.s.m.bin(c, Bin::LShr, f, five), value)
+        } else { (f, x) };
+        let slot = self.xchg_slot(c, slot_index);
+        self.s.m.store(c, slot, value);
         self.xchg_barrier(c);
         let (k63, not63) = (self.s.m.i32(63), self.s.m.i32(!63));
         let wave = self.s.m.bin(c, Bin::And, f, not63);
         let lane = self.s.m.bin(c, Bin::And, lane, k63);
         let src = self.s.m.bin(c, Bin::Or, wave, lane);
-        let p = self.xchg_slot(c, src);
+        let index = if self.communicating {
+            let five = self.s.m.i32(5);
+            self.s.m.bin(c, Bin::LShr, src, five)
+        } else { src };
+        let p = self.xchg_slot(c, index);
         let r = self.s.m.load(c, p);
         self.xchg_barrier(c);
         // Guess: a lane the group lacks reads as 0 (the console reads whatever its VGPR holds).
-        Ok(match self.xchg_written(c, src, 0) {
+        let result = match self.xchg_written(c, src, 0) {
             Some(there) => self.s.m.select(c, there, r, z),
             None => r,
-        })
+        };
+        if self.synchronized { self.s.m.exchange_end(c, start); }
+        Ok(result)
     }
 
     /// The console lane `v_readfirstlane_b32` reads in lockstep (`lockstep.rs`): the lowest bit of
@@ -226,6 +395,8 @@ impl Lower<'_> {
         let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
         let (z, k32, k63) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(63));
         let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+        let none_hi = self.s.m.cmp(c, pred::EQ, hi, z);
+        let fhi = self.s.m.select(c, none_hi, z, fhi);
         let low = self.s.m.cmp(c, pred::NE, lo, z);
         let r = self.s.m.select(c, low, flo, fhi);
         Ok(self.s.m.bin(c, Bin::And, r, k63))

@@ -117,12 +117,18 @@ fn shaders_the_host_cannot_run_are_refused_and_counted() {
     assert_eq!(refused.len(), 2, "{refused:?}");
     assert!(refused.iter().any(|(why, _)| why.contains("marks the pages")));
     assert!(refused.iter().any(|(why, _)| why.contains("thread group") || why.contains("conversion")));
-    // Compute shaders get the page table; a graphics pipeline does not yet.
+    // Compute shaders get the page table, and so does a graphics pipeline unless
+    // `VICTORY_GFX_PAGE_TABLE=0` asks for the old refusal (the reason `unsupported` gives
+    // without the table). This one is refused for its layout, which has none of its inputs.
     let mut vs = host_shader(HwStage::Vs, read("tests/fixtures/tri_vs.dxil"));
     vs.memory = true;
+    assert!(crate::native::shaders::unsupported(&vs, false).is_some_and(|why| why.contains("graphics pipeline")));
+    assert!(crate::native::shaders::unsupported(&vs, true).is_none());
     let g = Graphics::default();
     assert!(matches!(t.render_pipe(&vs, None, &g, "vs"), Pipe::Refused));
-    assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("graphics pipeline")));
+    let paged = crate::native::shaders::gfx_page_table();
+    assert_eq!(t.shaders.refused.iter().any(|(why, _)| why.contains("graphics pipeline")), !paged);
+    assert_eq!(t.shaders.refused.iter().any(|(why, _)| why.contains("the layout lacks")), paged);
     t.refused_translation("y", "no DXIL part".into());
     assert_eq!(t.shaders.refusals(), 5, "{:?}", t.shaders.refused);
 }

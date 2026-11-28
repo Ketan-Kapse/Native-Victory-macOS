@@ -139,7 +139,7 @@ fn lower(stage: HwStage, before: &[u32], image: [u32; 2]) -> Result<Lowered, Sha
             vec![]
         },
         prims: vec![],
-        mesh_stride: 0,
+        mesh_stride: 0, mesh_fit: Default::default(),
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
@@ -147,6 +147,7 @@ fn lower(stage: HwStage, before: &[u32], image: [u32; 2]) -> Result<Lowered, Sha
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
         view_marks: false,
     })
 }

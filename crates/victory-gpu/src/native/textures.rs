@@ -14,8 +14,9 @@
 //! next step. A change detiles the whole texture.
 //!
 //! A submission's textures are read, hashed and detiled on a few threads without the host's lock
-//! ([`prepare`]); only the probes that pick them ([`Title::sync_jobs`]) and the uploads
-//! ([`Title::sync_apply`]) hold it. Under the lock that work stopped every thread of a title that
+//! ([`prepare`]). Probe snapshots (`Title::probe_jobs`) and final uploads/metadata updates
+//! (`Title::sync_apply`) hold it; probe reads (`read_probes`) also run outside it. The locked
+//! reference probe path remains available through `VICTORY_SYNC_PROBES_OFFLOCK=0`. Under the lock that work stopped every thread of a title that
 //! streams (hundreds of MiB of textures a second), for most of each second.
 
 use super::descriptors::format;
@@ -33,6 +34,137 @@ use victory_formats::texture::{Dimension, Layout};
 const RENDER_TARGET: u32 = 1;
 const DEPTH_STENCIL: u32 = 2;
 const UNORDERED_ACCESS: u32 = 4;
+
+#[cfg(target_os = "macos")]
+pub(crate) mod bake;
+
+/// Submissions a texture a heap-indexed draw named stays exempt from being given up (`bake.rs`).
+pub(crate) const HEAP_READ_KEEP: u64 = 64;
+
+/// Behaviour of this file switched by a variable (docs/outfit-notes.md). Each is off unless its
+/// variable is `1`, except those in `DEFAULT_ON`, which are on unless it is `0`. Read once from
+/// the environment; a test turns one on for its own thread ([`force`]).
+pub(super) mod switch {
+    /// `VICTORY_PLACED_SHARE=1`: a placed view over the memory of a texture the GPU writes shows
+    /// that texture whenever one host texture can show both ([`super::Title::alias_placed`]).
+    /// Off: run T2 (2026-11-27) crashed the title with it.
+    pub const SHARE: u32 = 1;
+    /// `VICTORY_COPY_FULL` (on unless `0`): a GPU copy to or from a level the host texture was
+    /// made without gives the texture all its levels ([`super::Title::full_levels`]). Run T1
+    /// (2026-11-27): faces with eyes and hair, the best picture so far.
+    pub const COPY_FULL: u32 = 2;
+    /// Switches on unless their variable is `0`.
+    const DEFAULT_ON: u32 = COPY_FULL;
+    /// `VICTORY_BAKE_SOURCES=1`: before a draw that takes its textures from the heap at indices
+    /// in its constants, those textures are made, shown and read again (`bake.rs`).
+    pub const BAKE_SOURCES: u32 = 4;
+    /// `VICTORY_REMIRROR=1`: a texture made again is shown again by every entry that showed it
+    /// ([`super::Title::realize`]).
+    pub const REMIRROR: u32 = 8;
+    const NAMES: [(&str, u32); 4] = [
+        ("VICTORY_PLACED_SHARE", SHARE),
+        ("VICTORY_COPY_FULL", COPY_FULL),
+        ("VICTORY_BAKE_SOURCES", BAKE_SOURCES),
+        ("VICTORY_REMIRROR", REMIRROR),
+    ];
+
+    #[cfg(test)]
+    thread_local! { static FORCED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+
+    pub fn on(bit: u32) -> bool {
+        static ENV: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let env = *ENV.get_or_init(|| {
+            let bits = NAMES
+                .iter()
+                .filter(|(n, b)| match std::env::var(n) {
+                    Ok(v) => v == "1" || (DEFAULT_ON & b != 0 && v != "0"),
+                    Err(_) => DEFAULT_ON & b != 0,
+                })
+                .fold(0, |a, (_, b)| a | b);
+            if bits != 0 {
+                let on: Vec<&str> = NAMES.iter().filter(|(_, b)| bits & b != 0).map(|(n, _)| *n).collect();
+                tracing::info!(?on, "texture switches on");
+            }
+            bits
+        });
+        #[cfg(test)]
+        if FORCED.with(|f| f.get()) & bit != 0 {
+            return true;
+        }
+        #[cfg(test)]
+        if FORCED_OFF.with(|f| f.get()) & bit != 0 {
+            return false;
+        }
+        env & bit != 0
+    }
+
+    #[cfg(test)]
+    thread_local! { static FORCED_OFF: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+
+    /// Restores a thread's forced switches when it goes ([`force`], [`force_off`]).
+    #[cfg(all(test, target_os = "macos"))]
+    pub struct Guard(&'static std::thread::LocalKey<std::cell::Cell<u32>>, u32);
+
+    #[cfg(all(test, target_os = "macos"))]
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.with(|f| f.set(self.1));
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn guard(cell: &'static std::thread::LocalKey<std::cell::Cell<u32>>, bits: u32) -> Guard {
+        Guard(cell, cell.with(|f| f.replace(f.get() | bits)))
+    }
+
+    /// Turns `bits` on for this thread until the guard goes.
+    #[cfg(all(test, target_os = "macos"))]
+    pub fn force(bits: u32) -> Guard {
+        guard(&FORCED, bits)
+    }
+
+    /// Turns `bits` off for this thread until the guard goes (for switches on by default).
+    #[cfg(all(test, target_os = "macos"))]
+    pub fn force_off(bits: u32) -> Guard {
+        guard(&FORCED_OFF, bits)
+    }
+}
+
+/// The other format of a pair that differs in the sRGB curve alone: one host texture shows both
+/// (Metal makes a view of either over the other; it aborts on a block-compressed view of any
+/// other format, so nothing else block-compressed may share).
+fn srgb_pair(f: Format) -> Option<Format> {
+    Some(match f {
+        Format::Rgba8Unorm => Format::Rgba8UnormSrgb,
+        Format::Rgba8UnormSrgb => Format::Rgba8Unorm,
+        Format::Bgra8Unorm => Format::Bgra8UnormSrgb,
+        Format::Bgra8UnormSrgb => Format::Bgra8Unorm,
+        Format::Bc1 => Format::Bc1Srgb,
+        Format::Bc1Srgb => Format::Bc1,
+        Format::Bc3 => Format::Bc3Srgb,
+        Format::Bc3Srgb => Format::Bc3,
+        Format::Bc7 => Format::Bc7Srgb,
+        Format::Bc7Srgb => Format::Bc7,
+        _ => return None,
+    })
+}
+
+/// Submissions after the one that wrote an object of [`Title::alias_copies`] whose lists' end
+/// copies its texture into the views'. More than one: a copy recorded into the object is noted when
+/// it is recorded, and its list may be submitted later.
+const ALIAS_DUE: u64 = 3;
+
+/// Copies into placed views of another format made ([`Title::alias_copy_list`]).
+pub(super) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Which texture a key names now ([`Tracked::serial`]).
+static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// GPU copies skipped because a level they name was left off the host texture
+/// (`VICTORY_TEXTURE_DROP_TOP_MIP`), and textures given all their levels for a copy instead
+/// ([`Title::full_levels`]) with their bytes in title memory.
+#[cfg(target_os = "macos")]
+pub(super) static LEVEL_COPIES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// A title texture as the title made it: its description and where its memory is.
 #[derive(Clone)]
@@ -54,6 +186,78 @@ pub struct TextureInfo {
 impl TextureInfo {
     pub fn render_target(&self) -> bool {
         self.flags & (RENDER_TARGET | DEPTH_STENCIL) != 0
+    }
+
+    /// A placed R9G9B9E5 view `placed` can show this R32_UINT object's host texture: the same
+    /// memory and the same texels (extent, layers, samples). Levels and tile mode may differ; see
+    /// [`Title::alias_placed`].
+    fn shows_placed(&self, placed: &TextureInfo) -> bool {
+        self.format == 42
+            && placed.format == 67
+            && self.memory == placed.memory
+            && self.flags & DEPTH_STENCIL == 0
+            && self.dimension == placed.dimension
+            && (self.width, self.height, self.depth_or_layers) == (placed.width, placed.height, placed.depth_or_layers)
+            && self.layout.desc.samples == placed.layout.desc.samples
+    }
+
+    /// A placed view `placed` can show this GPU-written texture's host texture
+    /// (`VICTORY_PLACED_SHARE`): the same memory and texels (extent, layers, samples), in the
+    /// same host format or its sRGB partner, and no more levels than this one has. The rule of
+    /// the D3D12 path's `resource::alias_source` for the pairs that can share; the others (a
+    /// block-compressed view of plain texels) cannot on Metal.
+    fn shows_placed_wide(&self, placed: &TextureInfo) -> bool {
+        let formats = match (format(self.format), format(placed.format)) {
+            (Some(a), Some(b)) => a == b || srgb_pair(a) == Some(b),
+            _ => false,
+        };
+        formats
+            && self.memory == placed.memory
+            && (self.flags | placed.flags) & DEPTH_STENCIL == 0
+            && self.dimension == placed.dimension
+            && (self.width, self.height, self.depth_or_layers) == (placed.width, placed.height, placed.depth_or_layers)
+            && self.layout.desc.samples == placed.layout.desc.samples
+            && placed.layout.mips.len() <= self.layout.mips.len()
+    }
+
+    /// Whether placed view `placed` holds the same bytes as this texture in a format no host view
+    /// of it can take (`VICTORY_PLACED_SHARE`): plain texels of a compressed block's size (a GPU
+    /// encoder's output, written for unordered access) under a block-compressed view, the same
+    /// memory and tiling, as many texels as the view has blocks. The D3D12 path's
+    /// `resource::alias_source` rule for the pairs Metal cannot view across (it aborts on a
+    /// block-compressed view of another format): its texture is copied into the view's
+    /// ([`Title::alias_copy_list`]).
+    fn copies_into_placed(&self, placed: &TextureInfo) -> bool {
+        let (Some(a), Some(b)) = (format(self.format), format(placed.format)) else { return false };
+        let ((aw, ab), (bw, bb)) = (a.block(), b.block());
+        let bw = bw as u32;
+        aw == 1
+            && bw > 1
+            && ab == bb
+            && !a.is_depth()
+            && self.flags & DEPTH_STENCIL == 0
+            && self.memory == placed.memory
+            && self.dimension == placed.dimension
+            && self.width == placed.width.div_ceil(bw)
+            && self.height.max(1) == placed.height.max(1).div_ceil(bw)
+            && self.depth_or_layers == placed.depth_or_layers
+            && self.layout.desc.samples == placed.layout.desc.samples
+            && self.layout.desc.swizzle == placed.layout.desc.swizzle
+    }
+
+    /// Texels of level `mip` (width, height, depth).
+    fn level_dims(&self, mip: usize) -> [usize; 3] {
+        [
+            (self.width as usize >> mip).max(1),
+            (self.height.max(1) as usize >> mip).max(1),
+            self.layout.subresource_depth(mip as u32).max(1) as usize,
+        ]
+    }
+
+    /// Whether the GPU may write it by what the title made it as: a render target or one for
+    /// unordered access.
+    fn written_kind(&self) -> bool {
+        self.flags & (RENDER_TARGET | UNORDERED_ACCESS) != 0 && self.flags & DEPTH_STENCIL == 0
     }
 
     /// The backend's description of it; `None` for formats or shapes the host does not know.
@@ -97,8 +301,12 @@ impl TextureInfo {
 
     /// [`Self::desc`] without the dropped top levels: what the host texture is made as.
     pub fn host_desc(&self) -> Option<TextureDesc> {
+        self.host_desc_without(self.dropped_levels())
+    }
+
+    /// [`Self::desc`] without its top `n` levels.
+    pub fn host_desc_without(&self, n: usize) -> Option<TextureDesc> {
         let mut desc = self.desc()?;
-        let n = self.dropped_levels();
         desc.width = (desc.width >> n).max(1);
         desc.height = (desc.height >> n).max(1);
         desc.mips -= n;
@@ -118,7 +326,27 @@ const DROP_TOP_MIP_MIN_SIDE: u32 = 1024;
 /// address the smaller texture; render targets, UAV and 3D textures are never touched.
 pub fn drop_top_mip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if DROP_TOP_MIP_FORCED.with(std::cell::Cell::get) {
+        return true;
+    }
     *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_DROP_TOP_MIP").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! { static DROP_TOP_MIP_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+/// [`drop_top_mip`] on for this thread until the guard goes.
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn force_drop_top_mip() -> impl Drop {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DROP_TOP_MIP_FORCED.with(|f| f.set(false));
+        }
+    }
+    DROP_TOP_MIP_FORCED.with(|f| f.set(true));
+    Guard
 }
 
 /// Levels to leave off: one for a large, sampled-only 2D texture that has a level below its top.
@@ -459,7 +687,7 @@ const BACK_LIMIT: usize = 4 << 20;
 ///
 /// shortcut: copied back before a fence value is shown to the title; a title that instead polls a
 /// label the GPU writes into memory may read a frame late.
-pub(super) struct Back<B: PresentBackend> {
+pub(super) struct Back<B: PresentBackend + super::host::DescriptorBackend> {
     /// A fence of ours per title queue, and the last value queued on it.
     fences: HashMap<usize, (Rc<B::Fence>, u64)>,
     /// Submissions not yet copied back: reached when the fence has the value.
@@ -468,7 +696,7 @@ pub(super) struct Back<B: PresentBackend> {
     logged: std::collections::HashSet<usize>,
 }
 
-impl<B: PresentBackend> Default for Back<B> {
+impl<B: PresentBackend + super::host::DescriptorBackend> Default for Back<B> {
     fn default() -> Self {
         Back {
             fences: HashMap::new(),
@@ -478,7 +706,10 @@ impl<B: PresentBackend> Default for Back<B> {
     }
 }
 
-impl<B: PresentBackend> Back<B> {
+impl<B: PresentBackend + super::host::DescriptorBackend> Back<B> {
+    #[cfg(target_os = "macos")]
+    pub(super) fn has_pending(&self) -> bool { !self.pending.is_empty() }
+
     /// The signal the next work of title queue `key` carries (`None` with copy-back off): in the
     /// work's own command buffer, so it does not hang on the order command buffers complete in.
     pub(super) fn next(&mut self, host: &NativeHost<B>, key: usize) -> Option<(Rc<B::Fence>, u64)> {
@@ -596,6 +827,7 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
             let n = buf.len().min(size - off);
             unreadable |= !read_bytes(pool.as_deref(), at + off, &mut buf[..n], was_partial);
             h.update(&buf[..n]);
+            scan_pace(n);
         }
         let h = h.finalize();
         watch_in(watched, |w| {
@@ -617,13 +849,42 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
     }
 }
 
+/// `VICTORY_TEXTURE_SCAN_MBPS=<n>`: the scanner reads at most `n` MiB of title memory a second
+/// (unset or 0: as fast as it can, as before). The scanner touches every watched texture's
+/// memory each round; on a Mac near its memory limit that keeps pulling the title's cold texture
+/// pages back out of the compressor. With a limit, a write to a texture that is neither hot nor
+/// blank is seen later (a round takes the watched bytes divided by the rate).
+fn scan_pace(bytes: usize) {
+    static RATE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let Some(rate) = *RATE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_SCAN_MBPS").ok()?.parse::<u64>().ok().filter(|&n| n > 0)
+    }) else {
+        return;
+    };
+    // The time `bytes` are allowed to take at `rate` MiB a second, slept after the read.
+    let nanos = (bytes as u64).saturating_mul(1_000_000_000) / (rate << 20);
+    std::thread::sleep(std::time::Duration::from_nanos(nanos));
+}
+
+/// For the trace: placements of a description whose copy the host still had, and those of them
+/// that found other bytes in memory than the copy was filled from ([`Title::placed_again`]).
+static PLACED_AGAIN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Copies up to this size are compared with memory whole when their description is placed
+/// again, larger ones by their samples ([`Title::placed_again`]).
+const PLACED_WHOLE: usize = 64 << 10;
+/// For the trace: how long the scanner's last round took (ms), and its rounds so far.
+static SCAN_ROUND: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 fn start_scanner() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = std::thread::Builder::new().name("victory texture scan".into()).spawn(|| {
             let mut buf = vec![0u8; 1 << 20];
             loop {
+                let started = std::time::Instant::now();
                 scan_round(&WATCH, &mut buf);
+                SCAN_ROUND[0].store(started.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                SCAN_ROUND[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
@@ -962,57 +1223,10 @@ fn probe_round<B: ResourceBackend>(
         }
         probed += 1;
         let at = t.info.memory as usize;
-        let leave = if let Some(sync_serial) = hot_serial {
-            let sampled = probe_hash(
-                Some(memory),
-                at,
-                t.info.size,
-                Some(&t.info.layout),
-                false,
-                t.partial,
-                scratch,
-            );
-            // Its samples at the last upload (`sync_apply` moves them on).
-            let before = t.probe;
-            let changed = before != Some(sampled);
-            if !changed && t.uploads >= 2 && t.info.size <= PROBE_WHOLE {
-                let every = if t.sampled_sees_writes {
-                    WHOLE_EVERY << u32::from(t.unchanged_whole).min(WHOLE_BACKOFF_MAX)
-                } else {
-                    1
-                };
-                t.skipped = t.skipped.saturating_add(1);
-                if t.skipped >= every && !(t.sampled_sees_writes && spare >= WHOLE_SPARE) {
-                    t.skipped = 0;
-                    if t.sampled_sees_writes {
-                        spare += t.info.size;
-                    }
-                    // Read whole with the textures the submission reads anyway, without the host's
-                    // lock ([`prepare`]), and uploaded if that is not what the host texture holds
-                    // (a write the samples missed: `sync_apply`). Hashed here, the hot textures
-                    // of a title that streams were hundreds of MiB a second under the lock.
-                    dirty.insert(key);
-                    whole += t.info.size;
-                    WHOLE_PROBES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    WHOLE_PROBES[1].fetch_add(t.info.size as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            if changed {
-                t.skipped = 0;
-                dirty.insert(key);
-            } else if t.hot_until <= sync_serial {
-                t.hot_until = 0;
-            }
-            t.hot_until == 0
-        } else {
-            // Written at last.
-            let written = probe_nonzero(at, t.info.size, &t.info.layout, scratch);
-            if written {
-                dirty.insert(key);
-                t.blank = false;
-            }
-            written
-        };
+        let sample = if hot_serial.is_some() {
+            ProbeSample::Hot(probe_hash(Some(memory), at, t.info.size, Some(&t.info.layout), false, t.partial, scratch))
+        } else { ProbeSample::Blank(probe_nonzero(at, t.info.size, &t.info.layout, scratch)) };
+        let leave = apply_probe(t, key, hot_serial, sample, dirty, &mut whole, &mut spare);
         if leave {
             remove(keys, idx, &mut start, wrapped);
         } else {
@@ -1020,6 +1234,58 @@ fn probe_round<B: ResourceBackend>(
         }
     }
     *cursor = idx;
+}
+
+#[derive(Clone, Copy)]
+enum ProbeSample { Hot(blake3::Hash), Blank(bool) }
+
+// Shared by the locked reference path and off-lock snapshots: scheduling/backoff is unchanged.
+fn apply_probe<B: ResourceBackend>(
+    t: &mut Tracked<B>, key: usize, hot_serial: Option<u64>, sample: ProbeSample,
+    dirty: &mut std::collections::HashSet<usize>, whole: &mut usize, spare: &mut usize,
+) -> bool {
+    if let Some(sync_serial) = hot_serial {
+        let ProbeSample::Hot(sampled) = sample else { return false };
+        // Its samples at the last upload (`sync_apply` moves them on).
+        let before = t.probe;
+        let changed = before != Some(sampled);
+        if !changed && t.uploads >= 2 && t.info.size <= PROBE_WHOLE {
+            let every = if t.sampled_sees_writes {
+                WHOLE_EVERY << u32::from(t.unchanged_whole).min(WHOLE_BACKOFF_MAX)
+            } else {
+                1
+            };
+            t.skipped = t.skipped.saturating_add(1);
+            if t.skipped >= every && !(t.sampled_sees_writes && *spare >= WHOLE_SPARE) {
+                t.skipped = 0;
+                if t.sampled_sees_writes {
+                    *spare += t.info.size;
+                }
+                // Read whole with the textures the submission reads anyway, without the host's
+                // lock ([`prepare`]), and uploaded if that is not what the host texture holds
+                // (a write the samples missed: `sync_apply`). Hashed here, the hot textures
+                // of a title that streams were hundreds of MiB a second under the lock.
+                dirty.insert(key);
+                *whole += t.info.size;
+                WHOLE_PROBES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                WHOLE_PROBES[1].fetch_add(t.info.size as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if changed {
+            t.skipped = 0;
+            dirty.insert(key);
+        } else if t.hot_until <= sync_serial {
+            t.hot_until = 0;
+        }
+        t.hot_until == 0
+    } else {
+        let ProbeSample::Blank(written) = sample else { return false };
+        if written {
+            dirty.insert(key);
+            t.blank = false;
+        }
+        written
+    }
 }
 
 /// The key of a texture a view names by address and description (no resource object): a number no
@@ -1035,7 +1301,12 @@ pub fn placed_key(address: u64, description: &[u32; 14]) -> usize {
     (u64::from_le_bytes(b.as_bytes()[..8].try_into().expect("8 bytes")) | 1 << 63) as usize
 }
 
-impl<B: PresentBackend> Title<B> {
+/// Whether `key` is a placed view's ([`placed_key`]) and not a resource object's address.
+fn is_placed_key(key: usize) -> bool {
+    key >> 63 != 0
+}
+
+impl<B: PresentBackend + super::host::DescriptorBackend> Title<B> {
     /// Turns copying GPU-written textures back into title memory on or off.
     pub fn set_texture_back(&mut self, on: bool) {
         self.host.collect_written(on);
@@ -1108,19 +1379,31 @@ impl<B: PresentBackend> Title<B> {
     /// first names it (most of a title's textures are never used), and filled from title memory
     /// when work next goes to the GPU.
     pub fn texture_created(&mut self, key: usize, info: TextureInfo) {
+        // An object made at memory a placed view already names ([`Self::alias_placed_late`]).
+        let placed = (!is_placed_key(key) && info.format == 42)
+            .then(|| self.placed.get(&(info.memory as u64)).map(|&(k, _)| k))
+            .flatten();
         self.pending.insert(key, info);
+        if let Some(placed) = placed {
+            self.alias_placed_late(placed, key);
+        }
     }
 
     /// Makes the host texture of title texture `key` if it has none yet and registers it for
     /// views. `false` when there is none (not a title texture, or one the host cannot represent).
     pub fn realize(&mut self, key: usize) -> bool {
+        if self.host.is_covered(key) {
+            return false;
+        }
         if self.textures.contains_key(&key) || self.copies_of.contains_key(&key) {
             return true;
         }
         let Some(info) = self.pending.remove(&key) else {
             return false;
         };
-        let Some(desc) = info.host_desc() else {
+        // A texture a GPU copy named at its top level keeps every level ([`Self::full_levels`]).
+        let dropped = if self.full.contains(&key) { 0 } else { info.dropped_levels() };
+        let Some(desc) = info.host_desc_without(dropped) else {
             // Loud once per format: views of it get no texture and their draws sample nothing.
             static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
             let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -1136,8 +1419,18 @@ impl<B: PresentBackend> Title<B> {
         if let Some(owner) = self.identical_copy(&info) {
             let tex = self.textures[&owner].texture.clone();
             self.host.register_texture(key, &tex);
+            self.host.register_depth(key, &tex, &desc);
+            if desc.render_target && !desc.format.is_depth() {
+                self.host.register_attachable(key);
+            }
+            // The owner's texture, with the levels it has (all of them once a copy named its top).
+            let dropped = self.host.dropped_count(owner);
+            self.host.set_dropped_levels(key, dropped, info.layout.mips.len().max(1) - dropped);
             self.copies_of.insert(key, (owner, info));
             SHARED_TRACE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if switch::on(switch::REMIRROR) {
+                self.host.remirror_shown(key);
+            }
             return true;
         }
         let tex = match self.host.texture(&desc) {
@@ -1149,9 +1442,13 @@ impl<B: PresentBackend> Title<B> {
         };
         self.at_memory.entry(info.memory as usize).or_default().push(key);
         self.host.register_texture(key, &tex);
-        self.host.set_dropped_levels(key, info.dropped_levels(), desc.mips);
+        if desc.format.is_depth() {
+            self.host.register_depth(key, &tex, &desc);
+        } else if desc.render_target {
+            self.host.register_attachable(key);
+        }
+        self.host.set_dropped_levels(key, dropped, desc.mips);
         self.budget.live += info.size as u64;
-        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Depth-stencil textures are GPU-written depth targets whose CPU tile layout (e.g.
         // 4-byte or 2-byte plane 0) does not match Metal's combined depth-stencil texel layout,
@@ -1210,6 +1507,11 @@ impl<B: PresentBackend> Title<B> {
                 used: self.budget.serial,
             },
         );
+        if switch::on(switch::REMIRROR) {
+            self.host.remirror_shown(key);
+        }
+        // A texture the GPU writes, made at memory a placed view already shows.
+        self.share_late(key);
         true
     }
 
@@ -1217,6 +1519,9 @@ impl<B: PresentBackend> Title<B> {
     /// same layout, dimensions and host format, filled from that memory the same way (B4G4R4A4 is
     /// converted on upload), not a render target or depth (the GPU's, not memory's) and not
     /// GPU-written. Views of either then sample the same texels from one texture.
+    /// With `VICTORY_PLACED_SHARE` a GPU-written copy is shared too: it is that memory's
+    /// texture on the console, and a view of it made after a GPU copy went into it (a
+    /// compressor's result) must show the result, which title memory never gets here.
     fn identical_copy(&self, info: &TextureInfo) -> Option<usize> {
         let desc = info.desc()?;
         if info.render_target() || desc.format.is_depth() {
@@ -1224,7 +1529,7 @@ impl<B: PresentBackend> Title<B> {
         }
         self.at_memory.get(&(info.memory as usize))?.iter().copied().find(|k| {
             let o = &self.textures[k].info;
-            !self.textures[k].gpu_written
+            (!self.textures[k].gpu_written || switch::on(switch::SHARE))
                 && !o.render_target()
                 && o.size == info.size
                 && o.layout == info.layout
@@ -1245,6 +1550,13 @@ impl<B: PresentBackend> Title<B> {
     pub fn format_of(&self, key: usize) -> Option<Format> {
         let key = self.owner_of(key);
         self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
+    }
+
+    /// The realized texture description, also for a shared placed copy.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn texture_desc(&self, key: usize) -> Option<TextureDesc> {
+        let key = self.sharing_object(key).unwrap_or(key);
+        self.copies_of.get(&key).map(|(_, i)| i).or_else(|| self.textures.get(&self.owner_of(key)).map(|t| &t.info)).and_then(TextureInfo::host_desc)
     }
 
     /// The description the host keeps of title texture `key` (a placed one too, which no resource
@@ -1323,14 +1635,247 @@ impl<B: PresentBackend> Title<B> {
     pub fn gpu_written(&mut self, key: usize) {
         let key = self.owner_of(key);
         // A placed view sharing an object's texture ([`Self::alias_placed`]) writes the object's.
-        let key = self.shared.iter().find(|(_, (_, placed))| *placed == key).map_or(key, |(&object, _)| object);
+        let key = self.sharing_object(key).unwrap_or(key);
+        if let Some((_, due)) = self.alias_copies.get_mut(&key) {
+            *due = self.sync_serial.saturating_add(ALIAS_DUE);
+        }
+        let mut first = false;
         if let Some(t) = self.textures.get_mut(&key) {
+            first = !t.gpu_written;
             t.gpu_written = true;
             (t.hot_until, t.blank) = (0, false);
             if t.kept_from_memory() {
                 watch(|w| w.released(key));
             }
         }
+        if first {
+            // A placed view at its memory with a copy of its own shows this texture from now on.
+            self.share_late(key);
+        }
+    }
+
+    /// Resource object `obj` has a host texture the GPU writes (it was made as a target or for
+    /// unordered access, or a copy, draw or dispatch was just recorded into it) and the title
+    /// has a placed view at its memory that one host texture can show too
+    /// ([`TextureInfo::shows_placed_wide`]): the view names the object's texture from now on, and
+    /// every entry that shows the view is written again. Its own copy was filled from title
+    /// memory, which never receives what the GPU writes. Nothing without `VICTORY_PLACED_SHARE`.
+    fn share_late(&mut self, obj: usize) {
+        if !switch::on(switch::SHARE) || is_placed_key(obj) {
+            return;
+        }
+        let Some(o) = self.textures.get(&obj) else { return };
+        if !(o.gpu_written || o.info.written_kind()) {
+            return;
+        }
+        let address = o.info.memory as u64;
+        let Some(&(placed, _)) = self.placed.get(&address) else { return };
+        if self.sharing_object(placed) == Some(obj) {
+            return;
+        }
+        // A placed copy the GPU wrote itself (a copy recorded into an object that shares it)
+        // holds what this object's texture does not: left alone.
+        if self.textures.get(&placed).is_some_and(|t| t.gpu_written) {
+            return;
+        }
+        let info = self
+            .textures
+            .get(&placed)
+            .map(|t| &t.info)
+            .or_else(|| self.copies_of.get(&placed).map(|(_, i)| i))
+            .or_else(|| self.pending.get(&placed))
+            .or_else(|| self.shared.values().flatten().find(|(_, k, _)| *k == placed).map(|(_, _, i)| i));
+        let Some(info) = info.cloned() else { return };
+        if o.info.shows_placed_wide(&info) {
+            self.share_with(address, placed, &info, obj, "placed first");
+        } else if o.info.copies_into_placed(&info) && self.textures.contains_key(&placed) {
+            self.copy_into_placed(obj, placed);
+        }
+    }
+
+    /// A live resource object at `address` the GPU writes whose texels placed view `key`
+    /// (`info`) holds in a format one host texture cannot show ([`TextureInfo::copies_into_placed`]):
+    /// the newest of them.
+    fn copy_source_at(&self, address: u64, key: usize, info: &TextureInfo) -> Option<usize> {
+        self.at_memory
+            .get(&(address as usize))?
+            .iter()
+            .copied()
+            .filter(|&k| k != key && !is_placed_key(k))
+            .filter(|k| self.textures.get(k).is_some_and(|t| (t.gpu_written || t.info.written_kind()) && t.info.copies_into_placed(info)))
+            .max_by_key(|k| self.textures[k].serial)
+    }
+
+    /// Placed view `view` reads what the GPU writes into object `obj` in another format: the
+    /// object's texture is copied into the view's after the submissions that write it
+    /// ([`Self::alias_copy_list`]), and the view's is no longer filled from title memory after its
+    /// first upload (title memory never receives the GPU's result here).
+    fn copy_into_placed(&mut self, obj: usize, view: usize) {
+        let due = if self.textures.get(&obj).is_some_and(|t| t.gpu_written) { self.sync_serial.saturating_add(ALIAS_DUE) } else { 0 };
+        let (views, d) = self.alias_copies.entry(obj).or_default();
+        if !views.contains(&view) {
+            views.push(view);
+        }
+        *d = (*d).max(due);
+        if let Some(t) = self.textures.get_mut(&view) {
+            t.gpu_written = true;
+        }
+        static PAIRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = PAIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 64 || n.is_power_of_two() {
+            let o = self.textures.get(&obj).map(|t| (t.info.format, t.info.width, t.info.height));
+            let v = self.textures.get(&view).map(|t| (t.info.format, t.info.width, t.info.height));
+            tracing::info!(object = format!("{obj:#x}"), placed = format!("{view:#x}"), ?o, ?v, pairs = n, "a placed block-compressed view over plain texels the GPU writes: the object's texture is copied into the view's after each write");
+        }
+    }
+
+    /// One list of copies, run after a submission's lists: each object of [`Self::alias_copies`]
+    /// the GPU wrote within the last [`ALIAS_DUE`] submissions into the placed views that read it
+    /// in another format, level by level while their sizes in blocks agree, each level the two
+    /// host textures have. `None` with nothing due.
+    pub(super) fn alias_copy_list(&mut self) -> Option<NativeList<B>> {
+        if self.alias_copies.is_empty() {
+            return None;
+        }
+        let serial = self.sync_serial;
+        let due: Vec<(usize, Vec<usize>)> =
+            self.alias_copies.iter().filter(|(_, (_, d))| *d >= serial).map(|(&o, (v, _))| (o, v.clone())).collect();
+        let mut list = NativeList::default();
+        for (obj, views) in due {
+            let Some(src) = self.texture_of(obj) else { continue };
+            let Some(si) = self.textures.get(&self.owner_of(obj)).map(|t| t.info.clone()) else { continue };
+            let sd = self.host.dropped_count(obj);
+            for view in views {
+                let Some(dst) = self.texture_of(view) else { continue };
+                let Some(vi) = self.textures.get(&self.owner_of(view)).map(|t| t.info.clone()) else { continue };
+                let (Some(vf), vd) = (format(vi.format), self.host.dropped_count(view)) else { continue };
+                let bw = vf.block().0;
+                let layers = if si.dimension == Dimension::Tex3d { 1 } else { si.layout.slices.max(1).min(vi.layout.slices.max(1)) as usize };
+                for mip in 0..si.layout.mips.len().max(1).min(vi.layout.mips.len().max(1)) {
+                    let (s, v) = (si.level_dims(mip), vi.level_dims(mip));
+                    if s[0] != v[0].div_ceil(bw) || s[1] != v[1].div_ceil(bw) {
+                        break;
+                    }
+                    let (Some(sm), Some(vm)) = (mip.checked_sub(sd), mip.checked_sub(vd)) else { continue };
+                    for slice in 0..layers {
+                        list.copy_texture_region(&src, sm, slice, [0; 3], s, &dst, vm, slice, [0; 3]);
+                    }
+                }
+                ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        (!list.is_empty()).then_some(list)
+    }
+
+    /// Every level of title texture `key` on the host: a GPU copy names one the host texture was
+    /// made without (`VICTORY_TEXTURE_DROP_TOP_MIP` leaves the top level off large sampled
+    /// textures, and a copy to or from that level was skipped: a compressor's result copied into
+    /// level 0 never arrived, and the texture went on showing its lower levels as title memory
+    /// had them). A new host texture with all the levels takes its place under every key that
+    /// showed the old one, their entries are written again, and it is filled from title memory
+    /// at the next submission, before the copy runs. `false` (nothing done, the copy is skipped
+    /// as before) for a texture the GPU has written already: its levels are not in title memory.
+    #[cfg(target_os = "macos")]
+    pub(super) fn full_levels(&mut self, key: usize) -> bool {
+        let owner = self.owner_of(key);
+        let owner = self.sharing_object(owner).unwrap_or(owner);
+        if self.host.dropped_count(owner) == 0 {
+            return self.host.dropped_count(key) == 0;
+        }
+        let Some(t) = self.textures.get(&owner) else { return false };
+        if t.kept_from_memory() {
+            return false;
+        }
+        let Some(desc) = t.info.desc() else { return false };
+        let tex = match self.host.texture(&desc) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, ?desc, "no host texture with every level for a copy");
+                return false;
+            }
+        };
+        let t = self.textures.get_mut(&owner).expect("found above");
+        t.texture = tex.clone();
+        // Another texture under this key: what is being read for the old one is not uploaded.
+        t.serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (t.last, t.probe, t.uploads, t.uploaded_mips) = (None, None, 0, 0);
+        (t.hot_until, t.blank, t.partial, t.sampled_sees_writes, t.unchanged_whole, t.skipped) = (0, false, false, false, 0, 0);
+        #[cfg(target_os = "macos")]
+        t.target_views.clear();
+        let size = t.info.size as u64;
+        self.hot_keys.retain(|&k| k != owner);
+        self.blank_keys.retain(|&k| k != owner);
+        watch(|w| w.released(owner));
+        self.unloaded.insert(owner);
+        let mut keys = vec![owner];
+        keys.extend(self.copies_of.iter().filter(|(_, (o, _))| *o == owner).map(|(&k, _)| k));
+        keys.extend(self.shared.get(&owner).into_iter().flatten().map(|&(_, k, _)| k));
+        for k in keys {
+            self.full.insert(k);
+            self.host.register_texture(k, &tex);
+            self.host.set_dropped_levels(k, 0, desc.mips);
+            self.host.remirror_shown(k);
+        }
+        let n = LEVEL_COPIES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let bytes = LEVEL_COPIES[2].fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
+        if n <= 32 || n.is_power_of_two() {
+            tracing::info!(key = format!("{key:#x}"), format = ?desc.format, w = desc.width, h = desc.height, mips = desc.mips, textures = n, mib = bytes >> 20, "a GPU copy names a level its host texture was made without: made again with every level (VICTORY_COPY_FULL)");
+        }
+        true
+    }
+
+    /// The host texture's level for title level `mip` of `key` in a GPU copy: `None` for a level
+    /// the host texture was made without, which the copy then skips (counted, and logged for
+    /// the first few). With `VICTORY_COPY_FULL` the texture is given every level instead
+    /// ([`Self::full_levels`]).
+    #[cfg(target_os = "macos")]
+    pub(super) fn copy_level(&mut self, key: usize, mip: usize) -> Option<usize> {
+        self.realize(key);
+        let dropped = self.host.dropped_count(key);
+        if let Some(level) = mip.checked_sub(dropped) {
+            return Some(level);
+        }
+        if switch::on(switch::COPY_FULL) && self.full_levels(key) {
+            return Some(mip);
+        }
+        let n = LEVEL_COPIES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            let owner = self.owner_of(key);
+            let described = self.textures.get(&owner).map(|t| (t.info.format, t.info.width, t.info.height, t.info.layout.mips.len(), t.gpu_written));
+            tracing::warn!(key = format!("{key:#x}"), mip, dropped, ?described, skipped = n + 1, "a GPU copy names a level the host texture was made without (VICTORY_TEXTURE_DROP_TOP_MIP): skipped, the texture keeps what it had (VICTORY_COPY_FULL=0 is set)");
+        }
+        None
+    }
+
+    /// Placed copy `key` goes back to following title memory: the GPU wrote it through a
+    /// resource object that is gone now, and what the title's CPU writes there from here on (the
+    /// next texture streamed into the block under the same description) must show. What memory
+    /// holds now is the baseline: it never received the GPU's result, so it only differs from it
+    /// once the title writes.
+    fn follow_memory(&mut self, key: usize) {
+        let pools = self.host.memory();
+        let Some(t) = self.textures.get_mut(&key) else { return };
+        if t.info.render_target() || t.info.desc().is_none_or(|d| d.format.is_depth()) {
+            return;
+        }
+        let mut tiled = vec![0u8; t.info.size];
+        t.partial = read_into(Some(&pools), t.info.memory as usize, &mut tiled, t.partial);
+        let hash = blake3::hash(&tiled);
+        (t.gpu_written, t.last, t.probe) = (false, Some(hash), None);
+        // Every level holds texels: a level that reads zero later is uploaded as zeros.
+        (t.uploads, t.uploaded_mips) = (t.uploads.max(1), u32::MAX);
+        let entry = (t.info.memory as usize, t.info.size, false, t.serial);
+        let partial = t.partial;
+        start_scanner();
+        watch(|w| {
+            w.released(key);
+            w.entries.insert(key, entry);
+            w.pools.insert(key, pools);
+            w.seen.insert(key, hash);
+            if partial {
+                w.partial.insert(key);
+            }
+        });
     }
 
     /// How many times title texture `key`'s memory was detiled into its host texture.
@@ -1339,8 +1884,25 @@ impl<B: PresentBackend> Title<B> {
     }
 
     pub fn texture_released(&mut self, key: usize) {
-        self.copies_of.remove(&key);
+        let share = switch::on(switch::SHARE);
+        let was_sharer = self.copies_of.remove(&key).map(|(owner, _)| owner);
         self.covered.remove(&key);
+        self.full.remove(&key);
+        if !self.alias_copies.is_empty() {
+            self.alias_copies.remove(&key);
+            self.alias_copies.retain(|_, (views, _)| {
+                views.retain(|&v| v != key);
+                !views.is_empty()
+            });
+        }
+        // Placed views that show this texture ([`Self::alias_placed`]): those of the wider rule
+        // keep it (the memory and what the GPU wrote there stay; only the object is gone), the
+        // R9G9B9E5 ones go with it as before.
+        let (mut heirs, gone): (Vec<_>, Vec<_>) =
+            self.shared.remove(&key).unwrap_or_default().into_iter().partition(|(_, _, i)| share && i.format != 67);
+        // The copy the GPU wrote through this object is a placed view's ([`Self::realize`] shared
+        // it): with no object left to write it, it follows title memory again.
+        let mut follow = was_sharer.filter(|&o| share && !is_placed_key(key) && is_placed_key(o));
         if let Some(t) = self.textures.remove(&key) {
             self.budget.live -= t.info.size as u64;
             let at = t.info.memory as usize;
@@ -1367,14 +1929,32 @@ impl<B: PresentBackend> Title<B> {
                 watch(|w| w.entries.insert(first, (at, info.size, false, t.serial)));
                 let mut t = t;
                 t.info = info;
+                if share && t.gpu_written && is_placed_key(first) && !is_placed_key(key) {
+                    follow = Some(first);
+                }
                 self.textures.insert(first, t);
+                if !heirs.is_empty() {
+                    self.shared.entry(first).or_default().append(&mut heirs);
+                }
+            } else if !heirs.is_empty() {
+                // The first of the views is the texture's from now on, under its own description.
+                let (_, placed, info) = heirs.remove(0);
+                let mut t = t;
+                t.info = info;
+                t.serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.budget.live += t.info.size as u64;
+                self.at_memory.entry(t.info.memory as usize).or_default().push(placed);
+                self.textures.insert(placed, t);
+                if !heirs.is_empty() {
+                    self.shared.entry(placed).or_default().append(&mut heirs);
+                }
+                follow = Some(placed);
             }
         }
-        // A placed view that shares this texture ([`Self::alias_placed`]) goes with it.
-        if let Some((address, placed)) = self.shared.remove(&key)
-            && self.placed.get(&address).is_some_and(|&(k, _)| k == placed)
-        {
-            self.placed.remove(&address);
+        for (address, placed, _) in gone.into_iter().chain(heirs) {
+            if self.placed.get(&address).is_some_and(|&(k, _)| k == placed) {
+                self.placed.remove(&address);
+            }
             self.host.release_resource(placed);
         }
         self.pending.remove(&key);
@@ -1382,6 +1962,16 @@ impl<B: PresentBackend> Title<B> {
         self.hot_keys.retain(|&k| k != key);
         self.blank_keys.retain(|&k| k != key);
         watch(|w| w.released(key));
+        if let Some(placed) = follow
+            && !self.copies_of.iter().any(|(&k, (o, _))| *o == placed && !is_placed_key(k))
+        {
+            self.follow_memory(placed);
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn texture_watched(&self, key: usize) -> bool {
+        watch(|w| w.entries.contains_key(&key))
     }
 
     /// A view placed texture `key` at title `address` (in pool `pool`). The title has no object to
@@ -1389,11 +1979,22 @@ impl<B: PresentBackend> Title<B> {
     /// now (guess: the title is done with it once it places another there), and every texture
     /// placed in a pool goes when the pool is released ([`Self::sync_dirty`]).
     pub fn texture_placed(&mut self, address: u64, key: usize, pool: usize, size: usize) {
-        // A view of a copy given up before comes back at its own address: not a new placement.
-        if self.placed.get(&address).is_none_or(|&(k, _)| k != key) {
+        // Only a title placement reaches here, never a table scan or descriptor copy. A
+        // placement at the same address can now reclaim memory covered since the last one.
+        self.host.placed_again(key);
+        // Placed again while another placement covers it and its copy is still resident: the
+        // title uses both views. The pair is exempt before either is cleared.
+        if let Some(by) = self.covered.remove(&key)
+            && self.covered_clear
+        {
+            self.covered_history.exempt(by, key);
+            OVERLAP_TRACE[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.covered_clear || self.placed.get(&address).is_none_or(|&(k, _)| k != key) {
             self.give_up_overlapped(address, key, size as u64);
         }
         self.placed_reach = self.placed_reach.max(size as u64);
+        self.placed_again(key);
         if let Some((old, _)) = self.placed.insert(address, (key, pool))
             && old != key
         {
@@ -1406,9 +2007,104 @@ impl<B: PresentBackend> Title<B> {
                 REPLACED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 REPLACED[1].fetch_add(u64::from(were.contains(&(address, key))), std::sync::atomic::Ordering::Relaxed);
             }
+            self.note_replaced(old);
             self.host.forget_resource(old);
             self.texture_released(old);
         }
+    }
+
+    /// The title places description `key` at its address while the host still has the copy made
+    /// for an earlier placement of it. A key is an address and a description, not a texture:
+    /// the title's allocator gives a freed block to the next texture of the same size, and a
+    /// description placed there again may stand for another texture (a character's next colour
+    /// table in the block of the last one). The scanner would find the new bytes a round later
+    /// (6-10 s with a world's copies), too late for work that reads the texture once, right
+    /// after the placement (the title packs its small colour tables into a target on the GPU
+    /// that way). So the copy is compared with memory
+    /// now, read again at the next submission if it differs, and probed at every submission for
+    /// a while (the title may fill the block only after it made the view).
+    /// Only with `VICTORY_PLACED_AGAIN=1`: no run has shown it to change a picture, and it
+    /// writes new contents into a host texture work in flight may still use (shortcut: a new
+    /// host texture and rewritten entries would be the safe form).
+    fn placed_again(&mut self, key: usize) {
+        if !self.reread_placed {
+            return;
+        }
+        let owner = self.owner_of(key);
+        let Some(t) = self.textures.get_mut(&owner) else { return };
+        // Never read from memory yet (the first read comes anyway), or not filled from it.
+        if t.last.is_none() || t.kept_from_memory() || t.info.render_target() || t.info.desc().is_none_or(|d| d.format.is_depth()) {
+            return;
+        }
+        PLACED_AGAIN[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pools = self.host.memory();
+        let at = t.info.memory as usize;
+        let changed = if t.info.size <= PLACED_WHOLE {
+            let mut tiled = vec![0u8; t.info.size];
+            let _ = read_into(Some(&pools), at, &mut tiled, t.partial);
+            t.last != Some(blake3::hash(&tiled))
+        } else {
+            // Its samples, as at its last whole read ([`probe_read`]).
+            t.probe.is_some_and(|p| p != probe_hash(Some(&pools), at, t.info.size, Some(&t.info.layout), false, t.partial, &mut self.probe_buf))
+        };
+        if t.hot_until == 0 {
+            self.hot_keys.push(owner);
+        }
+        t.hot_until = self.sync_serial.wrapping_add(u64::from(HOT)).max(1);
+        if changed {
+            PLACED_AGAIN[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.unloaded.insert(owner);
+        }
+    }
+
+    /// A placed descriptor created by the title (`placement`), or an existing record copied
+    /// to another heap slot. Only creation changes which placement owns overlapping memory.
+    #[cfg(target_os = "macos")]
+    pub(super) fn placed_view(
+        &mut self,
+        address: u64,
+        key: usize,
+        pool: usize,
+        info: TextureInfo,
+        placement: bool,
+    ) {
+        if placement {
+            self.texture_placed(address, key, pool, info.size);
+        } else if self.placed.get(&address).is_some_and(|&(k, _)| k != key) {
+            return;
+        } else if self.host.is_covered(key) {
+            // The title copies the record of a copy given up as covered: the view is in use, the
+            // guess that its entries were stale was wrong. It is made again below, and the
+            // placement that covered it never covers it again.
+            self.host.placed_again(key);
+            self.covered_history.revived(key);
+            OVERLAP_TRACE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if !self.host.knows(key) {
+            // A record first encountered after its memory was mapped is tracked for pool
+            // release too, but its discovery is not evidence of a new placement.
+            self.placed.entry(address).or_insert((key, pool));
+            self.placed_reach = self.placed_reach.max(info.size as u64);
+            if !self.alias_placed(address, key, &info) {
+                self.texture_created(key, info);
+                self.realize(key);
+            }
+        }
+    }
+
+    /// The title copied the record of placed view `key` into another heap entry
+    /// (`CopyDescriptors`). A copy another placement covers that is still resident stays: the
+    /// title uses the view, so both are live and the pair is exempt from now on. `false` (nothing
+    /// done) for any other key. (One already given up is made again by [`Self::placed_view`].)
+    #[cfg(target_os = "macos")]
+    pub(super) fn copied_while_covered(&mut self, key: usize) -> bool {
+        if !self.covered_clear {
+            return false;
+        }
+        let Some(by) = self.covered.remove(&key) else { return false };
+        self.covered_history.exempt(by, key);
+        OVERLAP_TRACE[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     /// Placed copies over `[address, address + size)` that start elsewhere, which placed texture
@@ -1433,14 +2129,20 @@ impl<B: PresentBackend> Title<B> {
                 })
             })
             .collect();
-        self.covered.extend(over);
+        for old in over {
+            if !self.covered_clear || self.covered_history.placed_over(key, old) {
+                self.covered.insert(old, key);
+            } else {
+                self.covered.remove(&old);
+            }
+        }
     }
 
-    /// At each sync: covered copies ([`Self::give_up_overlapped`]) that nothing uses any more are
-    /// given up as the budget gives one up ([`Self::evictable`]: no heap entry shows one, so no
-    /// work in flight reads it through an entry, and no list holds one), and none a submission in
-    /// flight names. One still shown waits until the title writes another record over that entry.
-    /// One named again later is made again from title memory.
+    /// At each sync, give up covered copies ([`Self::give_up_overlapped`]) with no submission
+    /// naming them and no list holding them. Guess: entries left showing a memory-only copy are
+    /// stale; keep their records null until the title places it again. VICTORY_COVERED_CLEAR=0
+    /// keeps upstream's wait: one still shown waits until the title writes another record over
+    /// that entry. One named again later is made again from title memory.
     ///
     /// shortcut: a sync checks at most [`COVERED_CHECKS`] of them, round-robin (a world keeps ~9,000
     /// covered copies in use, and checking them all took ~8 ms of each submission under the host's
@@ -1448,61 +2150,177 @@ impl<B: PresentBackend> Title<B> {
     /// copies whose entries or lists changed if memory is short.
     pub(super) fn give_up_covered(&mut self) {
         if self.covered_queue.is_empty() {
-            self.covered_queue = self.covered.iter().copied().collect();
+            self.covered_queue = self.covered.keys().copied().collect();
         }
         let keys = self.covered_queue.split_off(self.covered_queue.len().saturating_sub(COVERED_CHECKS));
         for k in keys {
-            if !self.covered.contains(&k) {
-                continue;
-            }
+            // Covered no more since the sweep began, or by another placement now.
+            let Some(&by) = self.covered.get(&k) else { continue };
             let Some(t) = self.textures.get(&k) else {
                 self.covered.remove(&k);
                 continue;
             };
-            if self.budget.named.contains_key(&k) || !self.evictable(k, t) {
+            if self.budget.named.contains_key(&k) || !self.holds_only_memory(k, t)
+                || Rc::strong_count(&t.texture) > 2
+                || self.heap_read_lately(k)
+            {
+                continue;
+            }
+            let clear = self.host.texture_in_use(k);
+            if clear && !self.covered_clear {
+                continue;
+            }
+            if self.covered_clear && !self.covered_history.may_cover(by, k) {
+                self.covered.remove(&k);
                 continue;
             }
             let info = t.info.clone();
+            if clear {
+                OVERLAP_TRACE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                OVERLAP_TRACE[3].fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             OVERLAP_TRACE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             OVERLAP_TRACE[1].fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
-            self.host.evict_texture(k);
+            if self.covered_clear {
+                self.covered_history.record(by, k);
+                self.host.cover_texture(k);
+            } else {
+                self.host.evict_texture(k);
+            }
             self.texture_released(k);
             self.pending.insert(k, info);
         }
     }
 
-    /// A placed R9G9B9E5 texture `key` laid out exactly as a live R32_UINT resource object at the
-    /// same memory (the title reads as floats what compute wrote as integers): `key` names the
-    /// object's host texture, which its views cast, instead of a copy only title memory fills.
-    /// `false` (nothing done) for any other placed texture.
+    /// A placed R9G9B9E5 texture `key` over a live R32_UINT resource object at the same memory
+    /// with the same extent (the title reads as floats what compute wrote as integers): `key`
+    /// names the object's host texture, which its views cast, instead of a copy only title memory
+    /// fills, which the GPU never writes and which reads zero. The two descriptions need not give
+    /// the same bytes: the title describes some of these views with another mip count or tile
+    /// mode than the object (their sizes in memory differ), and the texture is the GPU's either
+    /// way; a view's levels are cut to those the object has. Of several objects there (one made
+    /// anew before the old one is released) the newest is taken. `false` (nothing done) for any
+    /// other placed texture.
+    ///
+    /// With `VICTORY_PLACED_SHARE` the same goes for any placed view over a live texture the GPU
+    /// writes (a target, one for unordered access, or one a copy, draw or dispatch was recorded
+    /// into: a compressor's block-compressed result) that one host texture can show
+    /// ([`TextureInfo::shows_placed_wide`]): the D3D12 path's rule (`resource::alias_source`),
+    /// for the pairs Metal can view.
     pub fn alias_placed(&mut self, address: u64, key: usize, info: &TextureInfo) -> bool {
-        let over = |o: &TextureInfo| {
-            o.format == 42 && o.memory == info.memory && o.size == info.size && o.layout == info.layout
-        };
-        // Object keys are addresses; placed keys have the top bit set ([`placed_key`]).
-        let object = |k: usize| k >> 63 == 0;
-        if info.format != 67 {
+        let wide = switch::on(switch::SHARE);
+        if info.format != 67 && !wide {
             return false;
         }
-        let Some(obj) = self
-            .textures
-            .iter()
-            .map(|(&k, t)| (k, &t.info))
-            .chain(self.pending.iter().map(|(&k, i)| (k, i)))
-            .find(|&(k, i)| object(k) && over(i))
-            .map(|(k, _)| k)
-        else {
+        // Realized objects first, the last made of them; then one no view has named yet.
+        let mut obj = None;
+        if info.format == 67 {
+            obj = self
+                .textures
+                .iter()
+                .filter(|&(&k, t)| !is_placed_key(k) && t.info.shows_placed(info))
+                .max_by_key(|(_, t)| t.serial)
+                .map(|(&k, _)| k)
+                .or_else(|| self.copies_of.iter().find(|&(&k, (_, i))| !is_placed_key(k) && i.shows_placed(info)).map(|(&k, _)| k))
+                .or_else(|| self.pending.iter().find(|&(&k, i)| !is_placed_key(k) && i.shows_placed(info)).map(|(&k, _)| k));
+        }
+        if obj.is_none() && wide {
+            // Only realized ones: one made later takes the view then ([`Self::share_late`]).
+            obj = self
+                .at_memory
+                .get(&(address as usize))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&k| k != key && !is_placed_key(k))
+                .filter(|k| self.textures.get(k).is_some_and(|t| (t.gpu_written || t.info.written_kind()) && t.info.shows_placed_wide(info)))
+                .max_by_key(|k| self.textures[k].serial);
+            if obj.is_none()
+                && let Some(src) = self.copy_source_at(address, key, info)
+            {
+                // A texture of its own, which the object's is copied into after each write.
+                self.texture_created(key, info.clone());
+                self.realize(key);
+                self.copy_into_placed(src, key);
+                return true;
+            }
+        }
+        let Some(obj) = obj else {
             return false;
         };
+        self.share_with(address, key, info, obj, "object first")
+    }
+
+    /// Resource object `obj` was made at memory placed view `placed` names. A view met before its
+    /// object exists has a copy of its own (title memory's, zeros), and one that shared an older
+    /// object there shows that one's texture; neither is written by the GPU again, and the title
+    /// does not place the view anew (its record is unchanged), so it is moved here.
+    fn alias_placed_late(&mut self, placed: usize, obj: usize) {
+        let Some(object) = self.pending.get(&obj) else { return };
+        let address = object.memory as u64;
+        let info = self
+            .textures
+            .get(&placed)
+            .map(|t| &t.info)
+            .or_else(|| self.copies_of.get(&placed).map(|(_, i)| i))
+            .or_else(|| self.pending.get(&placed))
+            .or_else(|| self.shared.values().flatten().find(|(_, k, _)| *k == placed).map(|(_, _, i)| i));
+        let Some(info) = info.filter(|i| object.shows_placed(i)).cloned() else { return };
+        self.share_with(address, placed, &info, obj, "placed first");
+    }
+
+    /// Placed view `key` (described by `info`) names the host texture of object `obj` from now on.
+    fn share_with(&mut self, address: u64, key: usize, info: &TextureInfo, obj: usize, order: &'static str) -> bool {
         let Some(texture) = self.texture_of(obj) else { return false };
+        // What the view showed until now goes: a copy of its own, or its share of another object.
+        for views in self.shared.values_mut() {
+            views.retain(|(_, k, _)| *k != key);
+        }
+        self.shared.retain(|_, views| !views.is_empty());
+        let had_copy = self.textures.contains_key(&key) || self.copies_of.contains_key(&key) || self.pending.contains_key(&key);
+        if had_copy {
+            self.texture_released(key);
+        }
+        if self.host.knows(key) {
+            // Entries that show the old texture are written again, whatever their records say.
+            self.host.forget_resource(key);
+        }
         self.host.register_texture(key, &texture);
-        self.shared.insert(obj, (address, key));
+        // The view's levels are the object's texture's: all of them for one made as GPU-written,
+        // without its top for a large sampled one a copy went into.
+        let owner = self.owner_of(obj);
+        let dropped = self.host.dropped_count(owner);
+        let levels = self.textures.get(&owner).map_or(0, |t| t.info.layout.mips.len().max(1));
+        self.host.set_dropped_levels(key, dropped, levels.saturating_sub(dropped));
+        self.shared.entry(obj).or_default().push((address, key, info.clone()));
+        if switch::on(switch::SHARE) || switch::on(switch::REMIRROR) {
+            // Entries a shader reaches by an index it computes are in no table: written now.
+            self.host.remirror_shown(key);
+        }
         static ALIASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = ALIASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n <= 1000 {
-            tracing::info!(placed = format!("{key:#x}"), object = format!("{obj:#x}"), aliased = n, "a placed R9G9B9E5 view shares an R32_UINT texture");
+            let object = self.textures.get(&self.owner_of(obj)).map(|t| &t.info);
+            // How the two descriptions differ, where they do (the cases an exact match missed).
+            let differs = object.filter(|o| o.size != info.size || o.layout != info.layout).map(|o| {
+                format!(
+                    "object {} bytes, {} levels, swizzle {:#x}; view {} bytes, {} levels, swizzle {:#x}",
+                    o.size, o.layout.mips.len(), o.layout.desc.swizzle.0, info.size, info.layout.mips.len(), info.layout.desc.swizzle.0
+                )
+            });
+            if info.format == 67 {
+                tracing::info!(placed = format!("{key:#x}"), object = format!("{obj:#x}"), address = format!("{address:#x}"), w = info.width, h = info.height, order, had_copy, ?differs, aliased = n, "a placed R9G9B9E5 view shares an R32_UINT texture");
+            } else {
+                let object_format = object.map(|o| o.format);
+                tracing::info!(placed = format!("{key:#x}"), object = format!("{obj:#x}"), address = format!("{address:#x}"), format = info.format, ?object_format, w = info.width, h = info.height, order, had_copy, ?differs, aliased = n, "a placed view shares the texture the GPU writes at its memory");
+            }
         }
         true
+    }
+
+    /// The resource object whose host texture placed view `key` names ([`Self::alias_placed`]).
+    fn sharing_object(&self, key: usize) -> Option<usize> {
+        self.shared.iter().find(|(_, views)| views.iter().any(|(_, k, _)| *k == key)).map(|(&object, _)| object)
     }
 
     /// Releases the textures placed in pools the title released since the last call.
@@ -1517,11 +2335,14 @@ impl<B: PresentBackend> Title<B> {
             .filter(|(_, (_, pool))| gone.contains(pool))
             .map(|(&a, _)| a)
             .collect();
+        let mut keys = HashSet::new();
         for a in dead {
             let (key, _) = self.placed.remove(&a).expect("listed above");
             self.host.release_resource(key);
             self.texture_released(key);
+            keys.insert(key);
         }
+        self.covered_history.forget(&keys);
     }
 
     /// Brings the textures the host samples up to date with title memory: those whose memory
@@ -1568,25 +2389,8 @@ impl<B: PresentBackend> Title<B> {
     /// [`Self::sync_jobs`] with `budget` of time for each round of probes (none: every hot and
     /// blank texture is probed).
     pub(super) fn sync_jobs_within(&mut self, budget: Option<std::time::Duration>) -> Vec<Job> {
-        self.sync_serial = self.sync_serial.wrapping_add(1);
-        self.release_placed();
-        for key in self.host.take_wanted() {
-            self.realize(key);
-        }
-        let timed = lock_traced();
-        let phase = |i: usize, since: std::time::Instant| {
-            if timed {
-                SYNC_PHASES[i].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            }
-            std::time::Instant::now()
-        };
-        let t = std::time::Instant::now();
-        self.keep_to_budget();
-        let t = phase(1, t);
-        self.give_up_covered();
+        let mut dirty = self.begin_sync();
         let pools = self.host.memory();
-        phase(2, t);
-        let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
         // a time budget so world streaming (thousands of blank textures) never stalls submissions;
         // the ones that changed lately first, then the blank ones.
@@ -1597,12 +2401,89 @@ impl<B: PresentBackend> Title<B> {
         let hot = std::time::Instant::now();
         let until = budget.map(|budget| hot + budget);
         probe_round(&pools, &mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, None, &mut self.probe_buf, &mut dirty);
-        phase(3, started);
+        sync_phase(lock_traced(), 3, started);
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
-            SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log();
+            SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log(self.shared.len());
         }
         let unloaded = std::mem::take(&mut self.unloaded);
         self.jobs(keys_to_sync(&unloaded, &dirty))
+    }
+
+    fn begin_sync(&mut self) -> std::collections::HashSet<usize> {
+        self.sync_serial = self.sync_serial.wrapping_add(1);
+        self.release_placed();
+        for key in self.host.take_wanted() {
+            self.realize(key);
+        }
+        let timed = lock_traced();
+        let t = std::time::Instant::now();
+        self.keep_to_budget();
+        let t = sync_phase(timed, 1, t);
+        self.give_up_covered();
+        self.trim_heap_reads();
+        sync_phase(timed, 2, t);
+        self.stale_audit();
+        watch(|w| std::mem::take(&mut w.dirty))
+    }
+
+    /// Snapshot only CPU metadata. No Rc or Metal object may cross the unlocked interval.
+    #[cfg(target_os = "macos")]
+    pub(super) fn probe_jobs(&mut self) -> (Vec<Job>, ProbeJobs) {
+        let dirty = self.begin_sync();
+        let unloaded = std::mem::take(&mut self.unloaded);
+        let initial = self.jobs(keys_to_sync(&unloaded, &dirty));
+        let serial = self.sync_serial;
+        self.hot_keys.retain(|key| {
+            let Some(t) = self.textures.get_mut(key) else { return false };
+            if t.hot_until < serial || t.kept_from_memory() { t.hot_until = 0; }
+            t.hot_until != 0
+        });
+        self.blank_keys.retain(|key| self.textures.get(key).is_some_and(|t| t.blank && !t.kept_from_memory()));
+        let snapshot = |keys: &[usize], cursor: usize| {
+            keys.iter().cycle().skip(if keys.is_empty() { 0 } else { cursor % keys.len() })
+                .take(keys.len().min(PROBE_JOBS)).filter_map(|key| {
+                    let t = self.textures.get(key)?;
+                    Some(ProbeJob {
+                        key: *key, serial: t.serial, last: t.last, uploads: t.uploads,
+                        at: t.info.memory as usize, size: t.info.size, layout: t.info.layout.clone(), partial: t.partial,
+                    })
+                }).collect()
+        };
+        let jobs = ProbeJobs {
+            memory: self.host.memory(), serial,
+            rounds: [snapshot(&self.hot_keys, self.hot_cursor), snapshot(&self.blank_keys, self.blank_cursor)],
+        };
+        (initial, jobs)
+    }
+
+    /// Reject results if release/replacement, an upload/copy-back, or GPU ownership intervened.
+    #[cfg(target_os = "macos")]
+    pub(super) fn apply_probes(&mut self, results: ProbeResults) -> Vec<Job> {
+        let mut dirty = std::collections::HashSet::new();
+        for (round, entries) in results.rounds.into_iter().enumerate() {
+            let mut last = None;
+            let mut remove = std::collections::HashSet::new();
+            let (mut whole, mut spare) = (0, 0);
+            for (visited, (job, sample)) in entries.into_iter().enumerate() {
+                if visited >= MIN_SYNC_HOT && whole >= WHOLE_BUDGET { break; }
+                last = Some(job.key);
+                let Some(t) = self.textures.get_mut(&job.key).filter(|t| job.current(t)) else {
+                    #[cfg(target_os = "macos")]
+                    victory_metal::frame_time::count(victory_metal::frame_time::Metric::ProbeStale, 1);
+                    continue;
+                };
+                if apply_probe(t, job.key, (round == 0).then_some(results.serial), sample, &mut dirty, &mut whole, &mut spare) {
+                    remove.insert(job.key);
+                }
+            }
+            let (keys, cursor) = if round == 0 { (&mut self.hot_keys, &mut self.hot_cursor) }
+                else { (&mut self.blank_keys, &mut self.blank_cursor) };
+            let resume = last.and_then(|last| keys.iter().position(|k| *k == last)).map(|i| i + 1);
+            if let Some(resume) = resume { *cursor = keys[..resume].iter().filter(|k| !remove.contains(k)).count(); }
+            keys.retain(|k| !remove.contains(k));
+            if keys.is_empty() { *cursor = 0; } else { *cursor %= keys.len(); }
+        }
+        self.jobs(dirty.into_iter().collect())
     }
 
     pub(super) fn jobs(&self, keys: Vec<usize>) -> Vec<Job> {
@@ -1625,7 +2506,7 @@ impl<B: PresentBackend> Title<B> {
                 last: t.last,
                 uploaded_mips: t.uploaded_mips,
                 partial: t.partial,
-                skip: t.info.dropped_levels(),
+                skip: self.host.dropped_count(key),
             })
         };
         let out: Vec<Job> = keys.into_iter().filter_map(job).collect();
@@ -1759,9 +2640,61 @@ impl<B: PresentBackend> Title<B> {
         });
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
             cost.upload = started.elapsed();
-            cost.log();
+            cost.log(self.shared.len());
         }
     }
+}
+
+// Bound the hot/blank working set copied under TITLE, preserving round-robin coverage and
+// the existing time budget. Unvisited textures remain watched and retain their place next time.
+#[cfg(target_os = "macos")]
+const PROBE_JOBS: usize = 1024;
+#[cfg(target_os = "macos")]
+struct ProbeJob {
+    key: usize,
+    serial: u64,
+    last: Option<blake3::Hash>,
+    uploads: u64,
+    at: usize,
+    size: usize,
+    layout: Layout,
+    partial: bool,
+}
+#[cfg(target_os = "macos")]
+impl ProbeJob {
+    fn current<B: ResourceBackend>(&self, t: &Tracked<B>) -> bool {
+        self.serial == t.serial && self.last == t.last && self.uploads == t.uploads && !t.kept_from_memory()
+    }
+}
+#[cfg(target_os = "macos")]
+pub(super) struct ProbeJobs {
+    memory: Arc<PoolTable>,
+    serial: u64,
+    rounds: [Vec<ProbeJob>; 2],
+}
+#[cfg(target_os = "macos")]
+pub(super) struct ProbeResults {
+    serial: u64,
+    rounds: [Vec<(ProbeJob, ProbeSample)>; 2],
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn read_probes(jobs: ProbeJobs) -> ProbeResults {
+    let mut scratch = Vec::new();
+    let mut rounds = [Vec::new(), Vec::new()];
+    for (round, entries) in jobs.rounds.into_iter().enumerate() {
+        let until = std::time::Instant::now() + PROBE_BUDGET;
+        for job in entries {
+            if rounds[round].len() >= MIN_SYNC_HOT && std::time::Instant::now() >= until { break; }
+            let sample = if round == 0 {
+                ProbeSample::Hot(probe_hash(Some(&jobs.memory), job.at, job.size, Some(&job.layout), false, job.partial, &mut scratch))
+            } else { ProbeSample::Blank(probe_nonzero(job.at, job.size, &job.layout, &mut scratch)) };
+            rounds[round].push((job, sample));
+        }
+        #[cfg(target_os = "macos")]
+        victory_metal::frame_time::count(victory_metal::frame_time::Metric::ProbeReads, rounds[round].len() as u64);
+    }
+    ProbeResults { serial: jobs.serial, rounds }
 }
 
 /// A texture whose memory a submission reads: what the reading needs, taken under the host's lock
@@ -1935,7 +2868,7 @@ struct SyncCost {
 }
 
 impl SyncCost {
-    fn log(self) {
+    fn log(self, aliases: usize) {
         static SUM: std::sync::Mutex<Option<(std::time::Instant, [u64; 14])>> = std::sync::Mutex::new(None);
         let mut sum = SUM.lock().unwrap_or_else(|e| e.into_inner());
         let (since, s) = sum.get_or_insert_with(|| (std::time::Instant::now(), [0; 14]));
@@ -1952,13 +2885,101 @@ impl SyncCost {
         if since.elapsed().as_secs() >= 1 {
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
-                "texture sync in the last {:.1} s: {} batches, {} textures ({} for the first time, {} unchanged, {} blank, {} partly unreadable), {} MiB; under the lock: probes of {} hot textures {} ms ({} read whole, {} MiB), of blank ones {} ms, uploads {} ms; off it: {} ms (on its threads: read {} ms, hash {} ms, detile {} ms); placements replaced {} ({} by one that was there before)",
+                "texture sync in the last {:.1} s: {} batches, {} textures ({} for the first time, {} unchanged, {} blank, {} partly unreadable), {} MiB; under the lock: probes of {} hot textures {} ms ({} read whole, {} MiB), of blank ones {} ms, uploads {} ms; off it: {} ms (on its threads: read {} ms, hash {} ms, detile {} ms); placements replaced {} ({} by one that was there before), {} live aliases",
                 since.elapsed().as_secs_f32(), s[0], s[1], s[2], s[3], s[4], s[5], s[6] >> 20,
                 take(&HOT), s[7] / 1000, take(&WHOLE_PROBES[0]), take(&WHOLE_PROBES[1]) >> 20, s[8] / 1000, s[9] / 1000,
                 s[10] / 1000, s[11] / 1000, s[12] / 1000, s[13] / 1000,
-                take(&REPLACED[0]), take(&REPLACED[1])
+                take(&REPLACED[0]), take(&REPLACED[1]), aliases
             );
             *sum = None;
+        }
+    }
+}
+
+/// Bounded recent directed clearings, separate from the reverse-displacement exemptions.
+/// Guess: an explicit title placement covering its displacer means both views are live.
+/// Every such pair is exempt for as long as both views' pool lives: the title keeps placing both
+/// (10,747 pairs within five minutes of the prologue), and a pair left out is cleared by turns,
+/// so one of two live textures always reads null. (A cap of 4,096 exemptions did that: materials
+/// lost their colour once it was full.)
+#[derive(Default)]
+pub(super) struct CoveredHistory {
+    released: HashSet<(usize, usize)>,
+    order: std::collections::VecDeque<(usize, usize)>,
+    allowed: HashSet<(usize, usize)>,
+    pub(super) ping_pong: u64,
+    /// Pairs exempted before either was cleared ([`Self::exempt`]): the title placed or copied
+    /// the covered view while its copy was still resident, or copied its record after.
+    pub(super) copied: u64,
+}
+
+impl CoveredHistory {
+    const LIMIT: usize = 4096;
+
+    fn may_cover(&self, new: usize, old: usize) -> bool {
+        let pair = (new.min(old), new.max(old));
+        !self.allowed.contains(&pair)
+    }
+
+    fn placed_over(&mut self, new: usize, old: usize) -> bool {
+        let pair = (new.min(old), new.max(old));
+        if !self.may_cover(new, old) {
+            return false;
+        }
+        if self.released.remove(&(old, new)) {
+            self.order.retain(|&p| p != (old, new));
+            self.ping_pong += 1;
+            self.allowed.insert(pair);
+            return false;
+        }
+        true
+    }
+
+    /// The title showed that covered copy `old` is in use beside `new`, the placement over its
+    /// memory (it placed `old` again, or copied its record): the pair is exempt, as after a
+    /// reverse displacement.
+    fn exempt(&mut self, new: usize, old: usize) {
+        let pair = (new.min(old), new.max(old));
+        if self.released.remove(&(new, old)) {
+            self.order.retain(|&p| p != (new, old));
+        }
+        if self.allowed.insert(pair) {
+            self.copied += 1;
+        }
+    }
+
+    /// As [`Self::exempt`], for a copy already given up: every recent placement that cleared it.
+    #[cfg(target_os = "macos")]
+    fn revived(&mut self, old: usize) {
+        let pairs: Vec<(usize, usize)> = self.released.iter().filter(|p| p.1 == old).copied().collect();
+        for (new, old) in pairs {
+            self.exempt(new, old);
+        }
+    }
+
+    /// Views released with their pool: their keys name nothing any more, so their exemptions and
+    /// history go (the exemptions hold no more pairs than the title has live views).
+    fn forget(&mut self, gone: &HashSet<usize>) {
+        if gone.is_empty() {
+            return;
+        }
+        let keeps = |p: &(usize, usize)| !gone.contains(&p.0) && !gone.contains(&p.1);
+        self.allowed.retain(keeps);
+        self.released.retain(keeps);
+        self.order.retain(keeps);
+    }
+
+    /// Exempt pairs now, for the trace.
+    fn exemptions(&self) -> usize {
+        self.allowed.len()
+    }
+
+    fn record(&mut self, new: usize, old: usize) {
+        if self.released.insert((new, old)) {
+            self.order.push_back((new, old));
+            if self.order.len() > Self::LIMIT {
+                self.released.remove(&self.order.pop_front().expect("bounded history"));
+            }
         }
     }
 }
@@ -1972,6 +2993,14 @@ pub(super) fn lock_traced() -> bool {
 /// With [`lock_traced`]: microseconds submissions spent in `keep_named`, `keep_to_budget`,
 /// `give_up_covered` and the probes (`Title::sync_jobs`).
 pub(super) static SYNC_PHASES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// With `timed` ([`lock_traced`]), adds the time since `since` to [`SYNC_PHASES`]`[i]`; the time now.
+fn sync_phase(timed: bool, i: usize, since: std::time::Instant) -> std::time::Instant {
+    if timed {
+        SYNC_PHASES[i].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    std::time::Instant::now()
+}
 
 /// Covered copies a sync checks at most ([`Title::give_up_covered`]).
 pub(super) const COVERED_CHECKS: usize = 512;
@@ -2057,12 +3086,14 @@ pub(super) fn distinct_bytes(mut ranges: Vec<(usize, usize)>) -> u64 {
 
 /// For the trace: textures given up under the budget, their bytes, and evicted ones made again.
 static BUDGET_TRACE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-/// For the trace: placed copies given up as another placement covered them, and their bytes.
-static OVERLAP_TRACE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// For the trace: covered copies and bytes given up, then the subset that needed entry clearing;
+/// copies given up that a title descriptor copy had made again, and covered copies such a copy
+/// kept before they were given up.
+static OVERLAP_TRACE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 /// For the trace: title textures that took an identical live copy's texture instead of their own.
 static SHARED_TRACE: [std::sync::atomic::AtomicU64; 1] = [const { std::sync::atomic::AtomicU64::new(0) }; 1];
 
-impl<B: PresentBackend> Title<B> {
+impl<B: PresentBackend + super::host::DescriptorBackend> Title<B> {
     /// Sets the texture budget in bytes (0: none).
     pub fn set_texture_budget(&mut self, bytes: u64) {
         self.budget.limit = bytes;
@@ -2073,7 +3104,7 @@ impl<B: PresentBackend> Title<B> {
     /// access), that no heap entry shows and no recorded or submitted work holds (the host's two
     /// references are all there are: `Title::textures` and the host's resources).
     fn evictable(&self, key: usize, t: &Tracked<B>) -> bool {
-        self.holds_only_memory(key, t) && Rc::strong_count(&t.texture) <= 2 && !self.host.texture_in_use(key)
+        self.holds_only_memory(key, t) && Rc::strong_count(&t.texture) <= 2 && !self.host.texture_in_use(key) && !self.heap_read_lately(key)
     }
 
     /// Whether copy `t` (title texture `key`) holds only what title memory does: a sampled texture
@@ -2083,6 +3114,129 @@ impl<B: PresentBackend> Title<B> {
             && !t.gpu_written
             && t.info.desc().is_some_and(|d| !d.format.is_depth())
             && !self.host.ever_unordered(key)
+    }
+
+    /// `VICTORY_TRACE_MEMORY=<seconds>` (10 if not a number): what the host's GPU memory holds,
+    /// by kind, every that many seconds: texture copies (count, host MiB as Metal counts them,
+    /// title MiB) by what they are, by format and by size; how many cover the same title memory
+    /// (by pool offset: the same range, the same start, any overlap) or hold identical bytes (the
+    /// same hash of their last upload); and [`NativeHost::buffer_breakdown`].
+    pub(super) fn trace_memory(&mut self) {
+        let Some(period) = memory_period() else { return };
+        if self.memory_logged.is_some_and(|t| t.elapsed() < period) {
+            return;
+        }
+        self.memory_logged = Some(std::time::Instant::now());
+        tracing::info!("memory by kind: textures: {}", self.memory_breakdown());
+        tracing::info!("memory by kind: buffers: {}", self.host.buffer_breakdown());
+    }
+
+    fn memory_breakdown(&self) -> String {
+        let mib = |b: u64| b >> 20;
+        let pools = self.host.memory();
+        let mut seen: HashSet<*const B::Texture> = HashSet::new();
+        // (count, host bytes, title bytes)
+        type Sum = (u64, u64, u64);
+        let add = |s: &mut Sum, host: u64, title: u64| {
+            s.0 += 1;
+            s.1 += host;
+            s.2 += title;
+        };
+        let (mut all, mut shared, mut targets, mut written, mut unordered, mut memory_only, mut covered, mut covered_used, mut in_use, mut dropped): (Sum, Sum, Sum, Sum, Sum, Sum, Sum, Sum, Sum, Sum) = Default::default();
+        let mut by_format: HashMap<String, Sum> = HashMap::new();
+        let mut by_size: [Sum; 6] = Default::default();
+        let mut by_range: HashMap<(usize, usize), Sum> = HashMap::new();
+        let mut by_start: HashMap<usize, (u64, u64)> = HashMap::new();
+        let mut by_hash: HashMap<blake3::Hash, Sum> = HashMap::new();
+        let mut ranges = Vec::new();
+        for (&key, t) in &self.textures {
+            let ptr = Rc::as_ptr(&t.texture);
+            let title = t.info.size as u64;
+            if !seen.insert(ptr) {
+                add(&mut shared, 0, title);
+                continue;
+            }
+            let host = self.host.backend.texture_bytes(&t.texture);
+            add(&mut all, host, title);
+            if t.info.render_target() {
+                add(&mut targets, host, title);
+            } else if t.gpu_written {
+                add(&mut written, host, title);
+            } else if self.host.ever_unordered(key) {
+                add(&mut unordered, host, title);
+            } else {
+                add(&mut memory_only, host, title);
+            }
+            if self.host.texture_in_use(key) {
+                add(&mut in_use, host, title);
+            }
+            if self.covered.contains_key(&key) {
+                add(&mut covered, host, title);
+                if self.host.texture_in_use(key) {
+                    add(&mut covered_used, host, title);
+                }
+            }
+            if self.host.dropped_count(key) > 0 {
+                add(&mut dropped, host, title);
+            }
+            let f = format(t.info.format).map_or_else(|| format!("dxgi{}", t.info.format), |f| format!("{f:?}"));
+            add(by_format.entry(f).or_default(), host, title);
+            let bucket = match host >> 20 {
+                0 => 0,
+                1..4 => 1,
+                4..16 => 2,
+                16..64 => 3,
+                64..256 => 4,
+                _ => 5,
+            };
+            add(&mut by_size[bucket], host, title);
+            let at = pools.resolve(t.info.memory as u64, 1).map_or(t.info.memory as usize, |(_, at)| at as usize);
+            ranges.push((at, t.info.size));
+            add(by_range.entry((at, t.info.size)).or_default(), host, title);
+            let e = by_start.entry(at).or_default();
+            e.0 += 1;
+            e.1 += host;
+            if let Some(h) = t.last {
+                add(by_hash.entry(h).or_default(), host, title);
+            }
+        }
+        // Copies beyond the first of a group, and their host bytes (the group's average each).
+        let extra = |groups: &mut dyn Iterator<Item = Sum>| -> (u64, u64) {
+            groups.filter(|g| g.0 > 1).fold((0, 0), |(n, b), g| (n + g.0 - 1, b + g.1 - g.1 / g.0))
+        };
+        let same_range = extra(&mut by_range.values().copied());
+        let same_start = extra(&mut by_start.values().map(|&(n, b)| (n, b, 0)));
+        let same_bytes = extra(&mut by_hash.values().copied());
+        let distinct = distinct_bytes(ranges);
+        let mut formats: Vec<(String, Sum)> = by_format.into_iter().collect();
+        formats.sort_by_key(|(_, s)| std::cmp::Reverse(s.1));
+        let formats: Vec<String> = formats.iter().take(8).map(|(f, s)| format!("{f} {} {} MiB", s.0, mib(s.1))).collect();
+        let sizes: Vec<String> = ["<1", "1-4", "4-16", "16-64", "64-256", ">=256"]
+            .iter()
+            .zip(&by_size)
+            .map(|(n, s)| format!("{n} MiB: {} {} MiB", s.0, mib(s.1)))
+            .collect();
+        let f = |n: &str, s: Sum| format!("{n} {} ({} MiB host, {} MiB title)", s.0, mib(s.1), mib(s.2));
+        format!(
+            "{}; {}; {}, {}, {}, {}; {}; {}, of them in use {}; {}; same title range {} ({} MiB), same start {} ({} MiB), title memory under them {} MiB distinct of {} MiB; identical bytes {} ({} MiB); not made now (given up or never named) {}; formats: {}; sizes: {}",
+            f("copies", all),
+            f("keys sharing another's copy", shared),
+            f("targets and depth", targets),
+            f("GPU-written", written),
+            f("viewed for unordered access", unordered),
+            f("memory only", memory_only),
+            f("in use", in_use),
+            f("covered", covered),
+            covered_used.0,
+            f("without their top level", dropped),
+            same_range.0, mib(same_range.1),
+            same_start.0, mib(same_start.1),
+            mib(distinct), mib(all.2),
+            same_bytes.0, mib(same_bytes.1),
+            self.pending.len(),
+            formats.join(", "),
+            sizes.join(", "),
+        )
     }
 
     /// For the trace: bytes of title memory under the copies, each byte once, and bytes of copies
@@ -2111,13 +3265,15 @@ impl<B: PresentBackend> Title<B> {
     /// [`Self::let_named_go`], once the submission is with its queue, so another submission's sync
     /// in between cannot give them up. Nothing is read under the budget with nothing given up
     /// (`glue::submit` runs one submission at a time, so none goes over budget in between), unless
-    /// the trace logs at this submission, so its figures match a run with the budget on.
+    /// the trace logs at this submission or covered entries may be cleared, so a named copy stays
+    /// protected even before the first eviction with the budget off.
     #[must_use = "the names stay kept until handed to `let_named_go`"]
     /// Whether [`Self::keep_named`] has anything to do: over budget, a texture given up, or the
-    /// trace due. Checked before the lists' snapshots are taken for it.
+    /// trace due, or covered entries that may be cleared. Checked before the lists' snapshots.
     pub(super) fn names_wanted(&self) -> bool {
         let over = self.budget.limit > 0 && self.budget.live > self.budget.limit;
         over || self.host.any_evicted() || self.budget.trace_due()
+            || (self.covered_clear && !self.covered.is_empty())
     }
 
     pub(super) fn keep_named<'a>(&mut self, lists: impl Iterator<Item = &'a NativeList<B>>) -> HashSet<usize>
@@ -2166,6 +3322,7 @@ impl<B: PresentBackend> Title<B> {
     /// Textures an entry shows, or the submission's tables name ([`Self::keep_named`]), are
     /// stamped used now.
     pub(super) fn keep_to_budget(&mut self) {
+        self.trace_memory();
         self.budget.serial += 1;
         let serial = self.budget.serial;
         let trace = self.budget.trace_due();
@@ -2208,12 +3365,181 @@ impl<B: PresentBackend> Title<B> {
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
             let (distinct, outside) = self.memory_under_copies();
             tracing::info!(
-                "host texture copies: {} MiB, budget {} MiB; {} MiB shown by heap entries, named by the submission's tables or viewed for unordered access, {} MiB could be given up; given up in the last second {} ({} MiB), made again {}; {} MiB of distinct title memory under the copies, {} MiB of copies outside the title's pools; in the last second {} textures shared an identical copy ({} share one now), {} placed copies another placement covered were given up ({} MiB), {} covered still in use",
+                "host texture copies: {} MiB, budget {} MiB; {} MiB shown by heap entries, named by the submission's tables or viewed for unordered access, {} MiB could be given up; given up in the last second {} ({} MiB), made again {}; {} MiB of distinct title memory under the copies, {} MiB of copies outside the title's pools; in the last second {} textures shared an identical copy ({} share one now), {} placed copies another placement covered were given up ({} MiB), {} covered still in use; {} covered copies given up by clearing entries ({} MiB), {} covered ping-pong pairs detected ({} pairs exempt now); in the last second {} given-up copies were made again for a descriptor copy and {} covered ones kept for a placement or copy of their own, {} pairs exempt that way so far",
                 self.budget.live >> 20, self.budget.limit >> 20, shown >> 20, evictable >> 20,
                 take(&BUDGET_TRACE[0]), take(&BUDGET_TRACE[1]) >> 20, take(&BUDGET_TRACE[2]),
                 distinct >> 20, outside >> 20,
                 take(&SHARED_TRACE[0]), self.copies_of.len(), take(&OVERLAP_TRACE[0]), take(&OVERLAP_TRACE[1]) >> 20, self.covered.len(),
+                take(&OVERLAP_TRACE[2]), take(&OVERLAP_TRACE[3]) >> 20,
+                self.covered_history.ping_pong, self.covered_history.exemptions(),
+                take(&OVERLAP_TRACE[4]), take(&OVERLAP_TRACE[5]), self.covered_history.copied,
             );
+        }
+    }
+}
+
+/// `VICTORY_TRACE_MEMORY=<seconds>` (10 if not a number): [`Title::trace_memory`].
+fn memory_period() -> Option<std::time::Duration> {
+    static PERIOD: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *PERIOD.get_or_init(|| {
+        let v = std::env::var("VICTORY_TRACE_MEMORY").ok()?;
+        Some(std::time::Duration::from_secs(v.trim().parse::<u64>().ok().filter(|&n| n > 0).unwrap_or(10)))
+    })
+}
+
+/// `VICTORY_TRACE_STALE=<seconds>`: every that many seconds (5 if not a number), whether what
+/// heap entries show is what title memory holds.
+fn stale_period() -> Option<std::time::Duration> {
+    static PERIOD: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *PERIOD.get_or_init(|| {
+        let v = std::env::var("VICTORY_TRACE_STALE").ok()?;
+        Some(std::time::Duration::from_secs(v.trim().parse::<u64>().ok().filter(|&n| n > 0).unwrap_or(5)))
+    })
+}
+
+/// A copy forgotten while heap entries showed it ([`Title::texture_placed`]: another description
+/// took its address), as `VICTORY_TRACE_STALE` remembers it.
+struct Replaced {
+    version: u64,
+    memory: usize,
+    size: usize,
+    layout: Layout,
+    partial: bool,
+    probe: Option<blake3::Hash>,
+    described: (u32, u32, u32),
+}
+
+/// What `VICTORY_TRACE_STALE` keeps between its checks.
+#[derive(Default)]
+pub(super) struct StaleAudit {
+    checked: Option<std::time::Instant>,
+    replaced: HashMap<usize, Replaced>,
+    /// Copies forgotten at their own address so far, and those of them an entry showed.
+    forgotten: [u64; 2],
+    /// Live copies whose memory read differently from their upload at the last check, with
+    /// their upload count then.
+    differed: HashMap<usize, u64>,
+}
+
+impl<B: PresentBackend + super::host::DescriptorBackend> Title<B> {
+    /// Placed copy `old` is about to be forgotten: another description took its address.
+    fn note_replaced(&mut self, old: usize) {
+        if stale_period().is_none() {
+            return;
+        }
+        self.stale.forgotten[0] += 1;
+        if !self.host.texture_in_use(old) {
+            return;
+        }
+        self.stale.forgotten[1] += 1;
+        let Some(t) = self.textures.get(&self.owner_of(old)) else { return };
+        let replaced = Replaced {
+            version: self.host.version_of(old),
+            memory: t.info.memory as usize,
+            size: t.info.size,
+            layout: t.info.layout.clone(),
+            partial: t.partial,
+            probe: t.probe,
+            described: (t.info.format, t.info.width, t.info.height),
+        };
+        self.stale.replaced.insert(old, replaced);
+    }
+
+    /// The `VICTORY_TRACE_STALE` check: one line of counts and up to 12 examples of each kind.
+    fn stale_audit(&mut self) {
+        let Some(period) = stale_period() else { return };
+        if self.stale.checked.is_some_and(|t| t.elapsed() < period) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let pools = self.host.memory();
+        let (shown, stale) = self.host.stale_entries();
+        let (mut gone, mut again) = ((0u32, 0u32), (0u32, 0u32));
+        for (&(key, _), &n) in &stale {
+            let side = if self.host.knows(key) { &mut again } else { &mut gone };
+            side.0 += 1;
+            side.1 += n;
+        }
+        let mut scratch = Vec::new();
+        // Copies forgotten at their own address that entries still show: has their memory changed?
+        self.stale.replaced.retain(|&key, r| stale.contains_key(&(key, r.version)));
+        let (mut frozen, mut frozen_entries, mut frozen_changed, mut frozen_bytes) = (0u32, 0u32, 0u32, 0u64);
+        let mut examples = Vec::new();
+        for (&key, r) in &self.stale.replaced {
+            frozen += 1;
+            frozen_entries += stale[&(key, r.version)];
+            let now = probe_hash(Some(&pools), r.memory, r.size, Some(&r.layout), false, r.partial, &mut scratch);
+            if r.probe.is_some_and(|p| p != now) {
+                frozen_changed += 1;
+                frozen_bytes += r.size as u64;
+                if examples.len() < 12 {
+                    examples.push(format!("{key:#x}@{:#x} f{} {}x{} {}B entries={} placed-again={}", r.memory, r.described.0, r.described.1, r.described.2, r.size, stale[&(key, r.version)], self.host.knows(key)));
+                }
+            }
+        }
+        // Live copies filled from memory that entries show: does memory read as it did at upload?
+        let (watched, dirty): (HashSet<usize>, HashSet<usize>) = watch(|w| (w.entries.keys().copied().collect(), w.dirty.clone()));
+        let (mut live, mut differ, mut late, mut late_bytes, mut unwatched) = (0u32, 0u32, 0u32, 0u64, 0u32);
+        let mut differed = HashMap::new();
+        let mut late_examples = Vec::new();
+        for (&key, t) in &self.textures {
+            if t.info.render_target() || t.kept_from_memory() || t.info.desc().is_none_or(|d| d.format.is_depth()) {
+                continue;
+            }
+            let Some(probe) = t.probe else { continue };
+            if !self.host.texture_in_use(key) {
+                continue;
+            }
+            live += 1;
+            let is_watched = watched.contains(&key) || self.unloaded.contains(&key);
+            unwatched += u32::from(!is_watched);
+            let now = probe_hash(Some(&pools), t.info.memory as usize, t.info.size, Some(&t.info.layout), false, t.partial, &mut scratch);
+            if now == probe {
+                continue;
+            }
+            differ += 1;
+            differed.insert(key, t.uploads);
+            // Differed at the last check too with no upload in between: the copy did not follow.
+            if self.stale.differed.get(&key) == Some(&t.uploads) {
+                late += 1;
+                late_bytes += t.info.size as u64;
+                if late_examples.len() < 12 {
+                    late_examples.push(format!(
+                        "{key:#x}@{:#x} f{} {}x{} {}B uploads={} watched={} dirty={} hot={} blank={} partial={} covered={}",
+                        t.info.memory as usize, t.info.format, t.info.width, t.info.height, t.info.size, t.uploads,
+                        is_watched, dirty.contains(&key), t.hot_until != 0, t.blank, t.partial, self.covered.contains_key(&key)
+                    ));
+                }
+            }
+        }
+        self.stale.differed = differed;
+        self.stale.checked = Some(std::time::Instant::now());
+        tracing::info!(
+            "stale check: {shown} heap entries show textures; {} of them ({} keys) show a texture forgotten since and {} ({} keys) the earlier texture of a key made again; copies forgotten at their own address so far {} ({} while an entry showed them), {frozen} of those still shown by {frozen_entries} entries, {frozen_changed} over title memory that changed since ({} MiB); {live} live copies shown and filled from memory, {unwatched} not watched, {differ} whose memory differs from their upload now, {late} that differed at the last check too with no upload since ({} MiB); {} placements so far of a description whose copy was live, {} of them over other bytes than the copy's; the scanner's last round took {} ms ({} rounds so far); took {} ms",
+            gone.1, gone.0, again.1, again.0, self.stale.forgotten[0], self.stale.forgotten[1],
+            frozen_bytes >> 20, late_bytes >> 20, PLACED_AGAIN[0].load(std::sync::atomic::Ordering::Relaxed), PLACED_AGAIN[1].load(std::sync::atomic::Ordering::Relaxed), SCAN_ROUND[0].load(std::sync::atomic::Ordering::Relaxed), SCAN_ROUND[1].load(std::sync::atomic::Ordering::Relaxed), started.elapsed().as_millis()
+        );
+        if !examples.is_empty() {
+            tracing::info!(?examples, "stale check: forgotten copies still shown over changed memory");
+        }
+        if !late_examples.is_empty() {
+            tracing::info!(examples = ?late_examples, "stale check: live copies that did not follow their memory");
+        }
+    }
+}
+
+impl<B: PresentBackend + super::host::DescriptorBackend> Title<B> {
+    /// Whether a heap-indexed draw named texture `key` within the last [`HEAP_READ_KEEP`]
+    /// submissions: it is not given up (covered-clear, budget).
+    pub(crate) fn heap_read_lately(&self, key: usize) -> bool {
+        self.heap_read.get(&key).is_some_and(|&s| s.saturating_add(HEAP_READ_KEEP) >= self.sync_serial)
+    }
+
+    /// Forgets heap reads older than [`HEAP_READ_KEEP`] submissions (now and then).
+    pub(crate) fn trim_heap_reads(&mut self) {
+        if self.sync_serial.is_multiple_of(HEAP_READ_KEEP) {
+            let serial = self.sync_serial;
+            self.heap_read.retain(|_, s| s.saturating_add(HEAP_READ_KEEP) >= serial);
         }
     }
 }
@@ -2228,6 +3554,57 @@ pub type Textures<B> = HashMap<usize, Tracked<B>>;
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn covered_clear_history_is_bounded_and_keeps_exemptions() {
+        let mut h = CoveredHistory::default();
+        assert!(h.may_cover(1, 2));
+        h.record(1, 2);
+        assert!(h.may_cover(2, 1), "a query is not a new title placement");
+        assert!(!h.placed_over(2, 1));
+        for i in 3..2 * CoveredHistory::LIMIT + 3 {
+            assert!(h.may_cover(i, 0));
+            h.record(i, 0);
+        }
+        assert_eq!(h.released.len(), CoveredHistory::LIMIT);
+        assert_eq!(h.order.len(), CoveredHistory::LIMIT, "streaming rotates recent history only");
+        assert!(!h.may_cover(1, 2) && !h.may_cover(2, 1));
+        assert_eq!(h.ping_pong, 1);
+        // Every reverse displacement exempts its pair, however many there are: one left out
+        // would be cleared by turns, a live texture reading null each time.
+        for i in 3..3 * CoveredHistory::LIMIT + 3 {
+            h.record(i, 0);
+            assert!(!h.placed_over(0, i), "pair {i}");
+            assert!(!h.may_cover(i, 0) && !h.may_cover(0, i));
+        }
+        assert_eq!(h.exemptions(), 3 * CoveredHistory::LIMIT + 1);
+        assert!(h.may_cover(usize::MAX, 0), "exemptions do not disable clearing of other pairs");
+        assert!(h.placed_over(usize::MAX, 0));
+        assert!(!h.may_cover(1, 2) && !h.may_cover(2, 1), "existing exemptions survive");
+        // A view placed or copied before it was cleared exempts its pair too, once.
+        h.exempt(7, usize::MAX - 1);
+        h.exempt(7, usize::MAX - 1);
+        assert!(!h.may_cover(usize::MAX - 1, 7));
+        assert_eq!(h.copied, 1);
+        // Views released with their pool take their pairs along.
+        h.forget(&HashSet::from([0]));
+        assert_eq!(h.exemptions(), 2);
+        assert!(h.may_cover(5, 0) && !h.may_cover(1, 2));
+
+        // A history full of exemptions still lets the real clearing path release a shown copy.
+        let mut f = super::super::host::mirror_tests::CoveredCopies::new();
+        f.title.covered_history = h;
+        let old = f.place(0, 32);
+        let heap = f.show(old);
+        let weak = Rc::downgrade(&f.title.host.texture_at(old).unwrap());
+        f.place(0x800, 16);
+        assert!(f.title.covered.contains_key(&old));
+        f.title.sync_dirty();
+        assert!(weak.upgrade().is_none() && f.title.host.is_covered(old));
+        assert!(!heap.shows_texture(old));
+        assert_eq!(heap.heap.borrow()[&0], (0, 0));
+    }
 
     #[test]
     fn sync_keys_include_overlaps_once_and_keep_unloaded_first() {
@@ -2984,5 +4361,107 @@ mod drop_top_mip_tests {
         assert_eq!(host_mip_range(3, 2, 1, 10), (2, 2));
         // A count past the end is clamped to the host's levels.
         assert_eq!(host_mip_range(5, 99, 1, 10), (4, 6));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod offlock_probe_tests {
+    use super::*;
+    use crate::native::host::mirror_tests::Recording;
+    use victory_formats::texture::{Desc, Swizzle};
+
+    fn tracked(memory: &[u8], key: usize) -> Tracked<Recording> {
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d, width: 4, height: 4, depth: 1, mips: 1,
+            element_bytes: 4, block: 1, samples: 1, swizzle: Swizzle::LINEAR,
+        }).unwrap();
+        Tracked {
+            texture: Rc::new(key), info: TextureInfo {
+                dimension: Dimension::Tex2d, format: 28, width: 4, height: 4, depth_or_layers: 1,
+                flags: 0, layout, memory: memory.as_ptr(), size: memory.len(),
+            },
+            serial: key as u64 + 1, last: Some(blake3::hash(memory)), uploads: 2, uploaded_mips: 1,
+            hot_until: 100, probe: Some(blake3::hash(memory)), sampled_sees_writes: false,
+            unchanged_whole: 0, skipped: 0, partial: false, blank: false,
+            #[cfg(target_os = "macos")]
+            target_views: Vec::new(),
+            gpu_written: false, used: 0,
+        }
+    }
+
+    fn fixture(memory: &[u8], count: usize) -> Title<Recording> {
+        let mut t = Title::new(Recording::default(), Arc::new(PoolTable::default()));
+        for key in 0..count { t.textures.insert(key, tracked(memory, key)); }
+        t.hot_keys = (0..count).collect();
+        t
+    }
+
+    #[test]
+    fn offlock_probes_match_locked_policy_and_reject_stale_results() {
+        fn sendable<T: Send>() {}
+        sendable::<ProbeJobs>();
+        sendable::<ProbeResults>();
+        let memory = [0x42; 256];
+        let mut locked = fixture(&memory, 4);
+        let mut unlocked = fixture(&memory, 4);
+        let (initial, jobs) = unlocked.probe_jobs();
+        assert!(initial.is_empty());
+        let results = read_probes(jobs);
+        let mut actual: Vec<_> = unlocked.apply_probes(results).iter().map(|j| j.key).collect();
+        let mut expected: Vec<_> = locked.sync_jobs_within(None).iter().map(|j| j.key).collect();
+        actual.sort_unstable(); expected.sort_unstable();
+        assert_eq!(actual, expected);
+        for key in 0..4 {
+            assert_eq!(unlocked.textures[&key].skipped, locked.textures[&key].skipped);
+            assert_eq!(unlocked.textures[&key].hot_until, locked.textures[&key].hot_until);
+        }
+        for change in 0..5 {
+            let mut t = fixture(&memory, 1);
+            let (_, jobs) = t.probe_jobs();
+            let results = read_probes(jobs);
+            match change {
+                0 => { t.textures.remove(&0); }
+                1 => t.textures.get_mut(&0).unwrap().serial += 1,
+                2 => t.textures.get_mut(&0).unwrap().last = None,
+                3 => t.textures.get_mut(&0).unwrap().uploads += 1,
+                _ => t.textures.get_mut(&0).unwrap().gpu_written = true,
+            }
+            assert!(t.apply_probes(results).is_empty(), "stale result {change}");
+        }
+    }
+
+    #[test]
+    fn offlock_probe_working_set_is_bounded_and_round_robin_does_not_starve() {
+        let memory = [0x42; 256];
+        let mut t = fixture(&memory, PROBE_JOBS + 7);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let (_, jobs) = t.probe_jobs();
+            assert!(jobs.rounds[0].len() <= PROBE_JOBS);
+            let results = read_probes(jobs);
+            seen.extend(results.rounds[0].iter().map(|(j, _)| j.key));
+            t.apply_probes(results);
+            if seen.len() == PROBE_JOBS + 7 { break; }
+        }
+        assert_eq!(seen.len(), PROBE_JOBS + 7);
+    }
+
+    #[test]
+    fn blank_probe_and_expiration_keep_the_next_cursor_valid() {
+        let memory = [0x42; 256];
+        let mut t = fixture(&memory, 4);
+        t.hot_cursor = 3;
+        t.textures.get_mut(&1).unwrap().hot_until = 0;
+        t.textures.get_mut(&2).unwrap().blank = true;
+        t.blank_keys.push(2);
+        let (_, jobs) = t.probe_jobs();
+        assert!(!jobs.rounds[0].iter().any(|j| j.key == 1));
+        let result = read_probes(jobs);
+        let keys: Vec<_> = t.apply_probes(result).into_iter().map(|j| j.key).collect();
+        assert!(keys.contains(&2));
+        assert!(!t.textures[&2].blank);
+        assert!(t.blank_keys.is_empty());
+        assert!(t.hot_cursor < t.hot_keys.len());
+        assert_eq!(t.blank_cursor, 0);
     }
 }

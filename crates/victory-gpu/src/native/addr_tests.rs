@@ -1158,6 +1158,107 @@ fn a_page_table_lasts_until_the_gpu_ran_the_work_submitted_with_it() {
     check_computed(&f, 0x2_0000, 0x6_0000);
 }
 
+/// A described pipeline (a stream's: not a guessed one, not a mesh one) whose vertex and pixel
+/// programs of `victory_shader::native::synthetic::memory_pair`, translated as the host
+/// translates, both read title memory through the page table, and its picture when the address in
+/// both stages' root constants is `VA_A`.
+fn described_memory_pipe(t: &mut Title<Metal>) -> (std::rc::Rc<<Metal as victory_backend::resources::GraphicsBackend>::RenderPipeline>, Option<std::rc::Rc<crate::native::list::Binding>>) {
+    let (vertex, pixel) = victory_shader::native::synthetic::memory_pair();
+    let (vs, ps) = (shaders::translate(&vertex).unwrap(), shaders::translate(&pixel).unwrap());
+    assert!(vs.memory && ps.memory && !vs.memory_writes && !ps.memory_writes);
+    let state = Graphics::default().with_targets(vec![Format::Rgba8Unorm], None);
+    assert!(!state.is_guessed());
+    match t.render_pipe(&vs, Some(&ps), &state, "described memory") {
+        Pipe::Render(pso, binding) => (pso, binding),
+        _ => panic!("{:?}", t.shaders),
+    }
+}
+
+/// The triangle of [`described_memory_pipe`] over an 8 x 8 target, reading at `VA_A`.
+fn described_memory_draw(
+    pipe: &(std::rc::Rc<<Metal as victory_backend::resources::GraphicsBackend>::RenderPipeline>, Option<std::rc::Rc<crate::native::list::Binding>>),
+    color: &std::rc::Rc<<Metal as ResourceBackend>::Texture>,
+) -> NativeList<Metal> {
+    let mut list = NativeList::default();
+    list.set_render_targets(std::slice::from_ref(color), None);
+    list.clear_render_target(color, [0.0; 4]);
+    list.set_graphics_pipeline(&pipe.0, Topology::Triangles);
+    list.set_graphics_binding(pipe.1.clone());
+    list.set_graphics_root_constants(0, &halves(VA_A));
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    list
+}
+
+/// What [`described_memory_draw`] shows when the three floats at the address are 0, 0, 1 and
+/// the dword at +16 is `green`: the third vertex's weight, (x + 0.5) / 16 in column x, as red.
+fn check_described_memory(t: &Title<Metal>, color: &std::rc::Rc<<Metal as ResourceBackend>::Texture>, green: u8) {
+    let mut pixels = [0; 8 * 8 * 4];
+    t.host.backend.read_texture(color, 0, 0, &mut pixels, 8 * 4, 0);
+    for (n, p) in pixels.chunks(4).enumerate() {
+        let red = ((n % 8) as f32 + 0.5) / 16.0 * 255.0;
+        assert!((f32::from(p[0]) - red).abs() <= 1.0 && p[1..] == [green, 0, 255], "pixel {n}: {p:?}, red {red}, green {green}");
+    }
+}
+
+/// The vertex shader and the pixel shader of a described graphics pipeline read title memory at
+/// addresses they compute: the page table is bound for both stages of a render pass, as for a
+/// compute pass. The vertex stage reads a float a vertex (interpolated: read as zeros, without
+/// the table, red would be 0 everywhere), the pixel stage a dword. The same again after the
+/// title mapped the address somewhere else in the pool.
+#[test]
+fn described_vertex_and_pixel_shaders_read_the_pool() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let pipe = described_memory_pipe(&mut t);
+    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+    desc.render_target = true;
+    let color = t.host.texture(&desc).unwrap();
+    f.put(0x2_0000, &[0.0f32, 0.0, 1.0, 0.0]);
+    f.put(0x2_0010, &[128u32]);
+    super::run(&t.host, &[&described_memory_draw(&pipe, &color)]);
+    check_described_memory(&t, &color, 128);
+    // VA_A now shows the pool from 0x4_0000.
+    t.host.memory().mapped(VA_A as usize, 0x8_0000, &f.info, 0x4_0000);
+    f.put(0x4_0000, &[0.0f32, 0.0, 1.0, 0.0]);
+    f.put(0x4_0010, &[77u32]);
+    super::run(&t.host, &[&described_memory_draw(&pipe, &color)]);
+    check_described_memory(&t, &color, 77);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+/// As for compute work ([`a_page_table_lasts_until_the_gpu_ran_the_work_submitted_with_it`]): a
+/// draw the GPU has not run yet reads the page table it was submitted with. It waits for a fence
+/// while the title moves the view twelve times, with a draw (and so a new table) each time;
+/// then it runs and still reads where its address was when it was submitted.
+#[test]
+fn a_page_table_lasts_until_the_gpu_ran_the_draw_submitted_with_it() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let pipe = described_memory_pipe(&mut t);
+    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+    desc.render_target = true;
+    let (color, other) = (t.host.texture(&desc).unwrap(), t.host.texture(&desc).unwrap());
+    f.put(0x2_0000, &[0.0f32, 0.0, 1.0, 0.0]);
+    f.put(0x2_0010, &[128u32]);
+    let waiting = described_memory_draw(&pipe, &color);
+    use victory_metal::backend::ComputeBackend;
+    let backend = &t.host.backend;
+    let (q, gate, done) = (backend.create_queue().unwrap(), backend.create_fence(0).unwrap(), backend.create_fence(0).unwrap());
+    t.host.execute(&q, &[&waiting], &[(&gate, 1)], &[(&done, 1)]).unwrap();
+    // Draws into another target, each after VA_A moved in the pool (to bytes of other values).
+    for k in 0..12 {
+        let offset = if k % 2 == 0 { 0x4_0000 } else { 0 };
+        t.host.memory().mapped(VA_A as usize, 0x8_0000, &f.info, offset);
+        f.put(offset, &[0.0f32, 0.0, 1.0, 0.0]);
+        f.put(offset + 16, &[10 + k as u32]);
+        super::run(&t.host, &[&described_memory_draw(&pipe, &other)]);
+        check_described_memory(&t, &other, 10 + k as u8);
+    }
+    t.host.backend.signal(&gate, 1);
+    assert!(t.host.backend.wait(&done, 1, 10_000), "GPU did not finish");
+    check_described_memory(&t, &color, 128);
+}
+
 /// A released pool's view pair goes to the next pool, and a heap that wrote the old pair (the
 /// host's own) writes it again: the same title addresses reach the new pool.
 #[test]

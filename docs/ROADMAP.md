@@ -35,7 +35,7 @@ Two problems stop it, in this order:
 Refused shaders drop their draws and dispatches. Unique refused shaders in the story load fell from 526 to about 150 on 27 November, and more fixes have landed since. Refusals now name their exact cause. The largest groups left:
 - a descriptor loaded from title memory at an address in a root constant (bindless; needs the host to map the address to a heap index);
 - a lane-mask join of an untracked mask;
-- cross-lane operations and LDS shared between the two host waves of a console wave, inside real per-lane branches (needs if-conversion so both host waves always arrive);
+- cross-lane operations outside the bounded multi-wave fallback: the group PC schedule now admits proven LDS phases and 32-bit atomics through 1024 threads ([round 3 shadow report](shadow-lds-atomics.md)). D's four classify helpers, E, F, J and two G programs now translate; six G programs and I still refuse for waterfalls or unproved cyclic title barriers. Unsupported mask joins and other excluded shapes remain refused; Metal values, resource limits, pipeline acceptance and dispatch cost still need coordinator validation;
 - a whole-wave section step the simulation does not follow.
 
 Fixed on 27 November: compute root constants, sized from the root signature's `Num32BitValues` (#114); `v_pk_fmac_f16` constants; wave64 lane-mask joins; `s_absdiff_i32`; signed BC6H; ExecuteIndirect with a count buffer. A batch on `fix/shader-refusals-2` also covers samplers built from constant bit masks, the thread-group info SGPR, and LDS behind uniform branches; it is being merged.
@@ -53,6 +53,8 @@ The whole game executable (about 440,000 functions) lifts to C in seconds and co
 ## 5. Everything after that
 
 - Reverb: the audio DSP's convolution has a synthetic CPU fallback behind `VICTORY_GUESS_DSP=1` (a fixed decaying-noise tail, not the title's own impulse response); default behaviour is unchanged (silence) until a real run judges whether it sounds right ([#17](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/17)). The hardware's impulse-response layout is still undocumented; `VICTORY_TRACE_DSP=1` logs the title's own `ir` data to help settle it.
+- Described vertex-ID rectangle lists now expand shader outputs and direct/indirect arguments to both triangles. Hand-built coverage tests compile; Metal and game verification remain pending (see `docs/native-host.md`).
+- Described rectangle lists with stage-in vertex attributes are drawn as strip instances, and described graphics pipelines whose shaders read title memory by address are given the page table (both were refused). Picture tests on Metal pass and the sets a run refused make pipelines offline; a game run has not been checked yet (see `docs/native-host.md`).
 - The Brightness logo draws as half a rectangle ([#16](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/16)).
 - Mesh-shader pipelines: direct and indirect mesh dispatches run on the native host (#353 for the direct ones), under a guessed record layout and a guessed `DispatchMeshX` group count.
 - Culling, depth, stencil and write mask in guessed pipelines are still partly guessed.
@@ -78,3 +80,9 @@ The whole game executable (about 440,000 functions) lifts to C in seconds and co
 - Pick a refused shader shape from section 3. It's self-contained and testable without the game.
 - Turn a finding in native-host.md into a unit test.
 - Improve `tools/macos/native-setup.sh` and `run-native.sh` for setups we haven't seen.
+
+
+Native mesh progress: decoded FSSM mesh/pixel pipelines now translate together and reach
+Metal mesh pipeline creation, direct dispatch and type-10 indirect encoding. The 32 KiB
+output guard is unconditional. Raw 0x1c8 mesh stage registers, console amplification
+translation and GPU pixel verification remain open; world rendering is not yet proven.

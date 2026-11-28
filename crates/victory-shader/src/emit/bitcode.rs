@@ -9,6 +9,14 @@ use std::collections::HashMap;
 
 use crate::structure::Map;
 
+mod rect;
+mod synchronized;
+mod exchanges;
+#[cfg(test)]
+mod execute;
+#[cfg(test)]
+pub(crate) use execute::TestProgram;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
 
@@ -209,6 +217,12 @@ enum MdDef {
 
 #[derive(Default)]
 pub(crate) struct Module {
+    exchanges: Vec<(usize, Vec<u32>)>,
+    exchange_releases: Vec<(u32, u64)>,
+    exchange_banks: HashMap<u32, u64>,
+    /// Barriers whose only purpose is to order an LDS atomic after the
+    /// previous LDS access (`elide_order_fences`).
+    order_fences: Vec<u32>,
     types: Vec<TypeDef>,
     type_ids: Map<TypeDef, u32>,
     consts: Vec<(Ty, Const)>,
@@ -607,6 +621,105 @@ impl Module {
             .filter(|&&i| plan.live[i as usize])
             .filter(|&&i| matches!(self.insts[i as usize].op, Op::Call(f, _) if self.funcs[f as usize].name == name))
             .count()
+    }
+
+    /// The written CFG is acyclic and every call of `name` is unavoidable from entry
+    /// to return. If-conversion uses this final check to keep exchanges outside
+    /// guarded effects, including guards introduced by instruction lowering.
+    pub fn calls_on_all_paths(&self, name: &str) -> bool {
+        let plan = self.plan();
+        fn acyclic(m: &Module, b: usize, state: &mut [u8]) -> bool {
+            match state[b] {
+                1 => return false,
+                2 => return true,
+                _ => {}
+            }
+            state[b] = 1;
+            let next = match m.term(b) {
+                Some(Term::Br(q)) => vec![q],
+                Some(Term::CondBr(_, t, f)) => vec![t, f],
+                _ => vec![],
+            };
+            if !next.into_iter().all(|q| acyclic(m, q, state)) { return false; }
+            state[b] = 2;
+            true
+        }
+        if !acyclic(self, 0, &mut vec![0; self.blocks.len()]) { return false; }
+        plan.layout.iter().filter(|&&b| self.blocks[b].body.iter().any(|&i| {
+            plan.live[i as usize] && matches!(self.insts[i as usize].op,
+                Op::Call(f, _) if self.funcs[f as usize].name == name)
+        })).all(|&avoid| {
+            let mut stack = vec![0];
+            let mut seen = vec![false; self.blocks.len()];
+            while let Some(b) = stack.pop() {
+                if b == avoid || std::mem::replace(&mut seen[b], true) { continue; }
+                match self.term(b) {
+                    Some(Term::Ret) => return false,
+                    Some(Term::Br(q)) => stack.push(q),
+                    Some(Term::CondBr(_, t, f)) => stack.extend([t, f]),
+                    None => {}
+                }
+            }
+            true
+        })
+    }
+
+    /// Every written operand is defined on all paths to its use, including guarded
+    /// resource results and loop-carried phi operands.
+    pub fn values_dominate_uses(&self) -> bool {
+        let plan = self.plan();
+        let n = self.blocks.len();
+        let mut predecessors = vec![Vec::new(); n];
+        let mut owner = vec![(usize::MAX, usize::MAX); self.insts.len()];
+        for &b in &plan.layout {
+            for &q in successors(self.term(b)).iter() {
+                predecessors[plan.to(q)].push(b);
+            }
+            for (k, &i) in self.blocks[b].phis.iter().chain(&self.blocks[b].body).enumerate() {
+                owner[i as usize] = (b, k);
+            }
+        }
+        let mut dom = vec![vec![true; n]; n];
+        loop {
+            let mut changed = false;
+            for &b in &plan.layout {
+                let mut d = if let Some(&p) = predecessors[b].first() {
+                    dom[p].clone()
+                } else { vec![false; n] };
+                for &p in predecessors[b].iter().skip(1) {
+                    for k in 0..n { d[k] &= dom[p][k]; }
+                }
+                d[b] = true;
+                changed |= d != dom[b];
+                dom[b] = d;
+            }
+            if !changed { break; }
+        }
+        let available = |v: V, b: usize, k: usize| match v {
+            V::Inst(i) => {
+                let (from, at) = owner[i as usize];
+                from < n && dom[b][from] && (from != b || at < k)
+            }
+            _ => true,
+        };
+        for &b in &plan.layout {
+            for (k, &i) in self.blocks[b].phis.iter().chain(&self.blocks[b].body).enumerate() {
+                if !plan.live[i as usize] { continue; }
+                let op = &self.insts[i as usize].op;
+                let mut valid = true;
+                if let Op::Phi(incoming) = op {
+                    for &(v, p) in incoming.iter().filter(|&&(_, p)| plan.edge(self, p, b)) {
+                        valid &= available(v, plan.src(p), usize::MAX);
+                    }
+                } else {
+                    for_each_operand(op, |v| valid &= available(v, b, k));
+                }
+                if !valid { return false; }
+            }
+            if let Some(Term::CondBr(c, _, _)) = self.term(b)
+                && !available(c, b, usize::MAX) { return false; }
+        }
+        true
     }
 
     /// Binary instructions of this type and opcode that [`Module::write`] writes.

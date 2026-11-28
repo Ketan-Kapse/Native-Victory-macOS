@@ -197,7 +197,7 @@ fn build(
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
-        mesh_stride: 0,
+        mesh_stride: 0, mesh_fit: Default::default(),
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
@@ -205,6 +205,7 @@ fn build(
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
         view_marks: false,
     })
     .expect("lower");

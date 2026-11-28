@@ -74,6 +74,28 @@ pub trait Observer: Send + Sync {
     fn mapped(&self, _at: usize, _len: usize, _pool: &PoolInfo, _offset: usize) {}
     /// `[at, at + len)` of title memory shows no pool any more.
     fn unmapped(&self, _at: usize, _len: usize) {}
+    /// Whether a released pool's own mapping stays until [`let_go_of_pool`] is called with its
+    /// id, rather than going when [`Self::pool_released`] returns: for a GPU backend whose queued
+    /// work may still reach the pool through a buffer over that mapping.
+    fn holds_released_pools(&self) -> bool {
+        false
+    }
+}
+
+/// Released pools whose own mapping an observer holds ([`Observer::holds_released_pools`]).
+static HELD: Mutex<BTreeMap<usize, PagePool>> = Mutex::new(BTreeMap::new());
+
+/// Unmaps the own mapping of released pool `id`, which the observer held until now
+/// ([`Observer::holds_released_pools`]). Nothing for a pool not held.
+pub fn let_go_of_pool(id: usize) {
+    let gone = HELD.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    drop(gone);
+}
+
+/// Released pools whose mapping is still held, and their bytes.
+pub fn held_pools() -> (usize, usize) {
+    let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    (held.len(), held.values().map(PagePool::len).sum())
 }
 
 static OBSERVER: Mutex<Option<Arc<dyn Observer>>> = Mutex::new(None);
@@ -106,7 +128,8 @@ pub fn pools() -> Vec<PoolInfo> {
 
 /// One allocation of physical pages.
 struct Pool {
-    pool: PagePool,
+    /// Given up in `drop`, or handed to [`HELD`].
+    pool: std::mem::ManuallyDrop<PagePool>,
     info: PoolInfo,
     /// Who allocated it (`VICTORY_TRACE_OWNERS`).
     owner: Option<Owner>,
@@ -151,7 +174,7 @@ impl Pool {
             observer.pool_created(&info);
         }
         Ok(Pool {
-            pool,
+            pool: std::mem::ManuallyDrop::new(pool),
             info,
             owner: tracing_owners().then(Owner::now),
             #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -166,8 +189,17 @@ impl Drop for Pool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.info.id);
+        let mut held = false;
         if let Some(observer) = observer() {
             observer.pool_released(&self.info);
+            held = observer.holds_released_pools();
+        }
+        // SAFETY: `pool` is not used after this.
+        let pool = unsafe { std::mem::ManuallyDrop::take(&mut self.pool) };
+        if held {
+            HELD.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(self.info.id, pool);
         }
     }
 }
@@ -1902,6 +1934,16 @@ mod tests {
 
     thread_local! {
         static EVENTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// Whether [`Log`] holds released pools on this thread.
+        static HOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Makes [`Log`] the observer (once for every test).
+    fn log_observer() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            set_observer(Some(Arc::new(Log)));
+        });
     }
 
     impl Observer for Log {
@@ -1920,14 +1962,44 @@ mod tests {
         fn unmapped(&self, at: usize, len: usize) {
             EVENTS.with(|e| e.borrow_mut().push(format!("unmapped {at:#x} {len:#x}")));
         }
+        fn holds_released_pools(&self) -> bool {
+            HOLD.with(std::cell::Cell::get)
+        }
+    }
+
+    /// An observer that holds released pools keeps a pool's own mapping, and its bytes, after the
+    /// title frees it, until it lets go of the pool: GPU work queued before the release may still
+    /// write the pool through a buffer over that mapping (docs/hang-notes.md).
+    #[test]
+    fn a_held_pool_stays_mapped_until_let_go() {
+        log_observer();
+        HOLD.with(|h| h.set(true));
+        // A size no other test uses, to find the pool.
+        let pages = allocate(11);
+        let info = pools()
+            .into_iter()
+            .find(|p| p.len == 11 * PAGE)
+            .expect("the pool is listed");
+        let a = reserve(11);
+        assert_eq!(XMemMapPhysicalPages(a, 11, pages.as_ptr()), a);
+        // SAFETY: mapped just above.
+        unsafe { (a as *mut u8).add(5).write(0x5a) };
+        assert_eq!(XMemMapPhysicalPages(a, 11, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(11, pages.as_ptr()), 1);
+        HOLD.with(|h| h.set(false));
+        assert!(pools().iter().all(|p| p.id != info.id), "released");
+        assert!(HELD.lock().unwrap().contains_key(&info.id), "but held");
+        if info.base != 0 {
+            // SAFETY: the held pool's own mapping is still there.
+            assert_eq!(unsafe { (info.base as *const u8).add(5).read() }, 0x5a);
+        }
+        let_go_of_pool(info.id);
+        assert!(!HELD.lock().unwrap().contains_key(&info.id), "let go");
     }
 
     #[test]
     fn the_observer_hears_of_pools_and_mappings() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            set_observer(Some(Arc::new(Log)));
-        });
+        log_observer();
         EVENTS.with(|e| e.borrow_mut().clear());
         // A size no other test uses, to find the pool.
         let pages = allocate(7);

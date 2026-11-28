@@ -30,6 +30,30 @@ pub trait PoolObserver: Send + Sync {
     fn unmapped(&self, at: usize, len: usize);
 }
 
+/// Called with a released pool's id once the GPU work submitted before the host heard of the
+/// release has finished: the runtime then unmaps the pool's own mapping, which it kept until now
+/// (`xmem_physical::let_go_of_pool`). The runtime sets it with the pool observer; without one,
+/// pools are unmapped when the title releases them.
+static POOL_HOOK: std::sync::OnceLock<fn(usize)> = std::sync::OnceLock::new();
+
+pub fn set_pool_release_hook(hook: fn(usize)) {
+    let _ = POOL_HOOK.set(hook);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The pools let go on this thread, for tests.
+    pub(crate) static LET_GO: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn let_go_of_pool(id: usize) {
+    #[cfg(test)]
+    LET_GO.with(|l| l.borrow_mut().push(id));
+    if let Some(hook) = POOL_HOOK.get() {
+        hook(id);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Map {
     len: usize,
@@ -88,6 +112,7 @@ impl Inner {
 #[derive(Default)]
 pub struct PoolTable {
     inner: Mutex<Inner>,
+    published_generation: std::sync::atomic::AtomicU64,
 }
 
 impl PoolTable {
@@ -128,6 +153,28 @@ impl PoolTable {
         ))
     }
 
+    /// The mappings over `[start, end)`, cut to it, in title order: `(title address, length,
+    /// pool id, the address of those bytes in the pool's own mapping)`. Mappings of pools the
+    /// table does not know are left out, as are empty ones.
+    pub fn covering(&self, start: usize, end: usize) -> Vec<(usize, usize, usize, usize)> {
+        let g = self.lock();
+        let first = g
+            .maps
+            .range(..start)
+            .next_back()
+            .filter(|&(&at, m)| at + m.len > start)
+            .map(|(&at, _)| at)
+            .unwrap_or(start);
+        g.maps
+            .range(first..end)
+            .filter_map(|(&at, m)| {
+                let pool = g.pools.get(&m.pool)?;
+                let (from, to) = (at.max(start), (at + m.len).min(end));
+                (from < to).then(|| (from, to - from, m.pool, pool.base + m.offset + (from - at)))
+            })
+            .collect()
+    }
+
     /// What the title maps at `[addr, addr + len)`, as a number that changes when any mapping in
     /// it does: a hash of the mappings it crosses (title address, length, pool, offset), which
     /// must follow one another in title addresses. `None` where part of it is not mapped.
@@ -154,7 +201,7 @@ impl PoolTable {
     /// A number that changes whenever a pool or a mapping does: what a table built from
     /// [`PoolTable::mappings`] is current for.
     pub fn generation(&self) -> u64 {
-        self.lock().generation
+        self.published_generation.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The mapping containing title address `addr`, if any, without copying the table.
@@ -272,6 +319,7 @@ impl PoolObserver for PoolTable {
         let mut g = self.lock();
         g.generation += 1;
         g.pools.insert(pool.id, pool.clone());
+        self.published_generation.store(g.generation, std::sync::atomic::Ordering::Release);
     }
 
     fn pool_released(&self, pool: &PoolInfo) {
@@ -280,6 +328,7 @@ impl PoolObserver for PoolTable {
         g.pools.remove(&pool.id);
         g.maps.retain(|_, m| m.pool != pool.id);
         g.released.push(pool.id);
+        self.published_generation.store(g.generation, std::sync::atomic::Ordering::Release);
     }
 
     fn mapped(&self, at: usize, len: usize, pool: &PoolInfo, offset: usize) {
@@ -294,10 +343,13 @@ impl PoolObserver for PoolTable {
                 offset,
             },
         );
+        self.published_generation.store(g.generation, std::sync::atomic::Ordering::Release);
     }
 
     fn unmapped(&self, at: usize, len: usize) {
-        self.lock().cut(at, len);
+        let mut g = self.lock();
+        g.cut(at, len);
+        self.published_generation.store(g.generation, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -312,6 +364,26 @@ mod tests {
             len: 0x100_0000,
             memory_entry: None,
         }
+    }
+
+    #[test]
+    fn every_observer_mutation_publishes_the_snapshot_generation() {
+        let t = PoolTable::default();
+        let p = pool(1);
+        let check = |previous| {
+            let generation = t.generation();
+            assert!(generation > previous);
+            assert_eq!(generation, t.mappings().0);
+            generation
+        };
+        t.pool_created(&p);
+        let generation = check(0);
+        t.mapped(0x7000_0000, 65536, &p, 0);
+        let generation = check(generation);
+        t.unmapped(0x7000_0000, 32768);
+        let generation = check(generation);
+        t.pool_released(&p);
+        check(generation);
     }
 
     #[test]

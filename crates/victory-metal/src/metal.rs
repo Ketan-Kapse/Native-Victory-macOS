@@ -32,9 +32,13 @@ pub struct Metal {
     /// by their DXIL and layout.
     compiling: Compiling<Result<ComputeState, String>>,
     /// As `compiling`, the render and mesh pipelines (`create_render_pipeline_within`).
-    pub(crate) compiling_render: Compiling<Result<(crate::gfx::RenderState, Option<MTLSize>), String>>,
+    pub(crate) compiling_render: Compiling<Result<(crate::gfx::RenderState, Option<crate::gfx::MeshDispatch>), String>>,
     /// `VICTORY_TRACE_GPU_FAILS`: label command buffers and encoders, report failures with them.
     pub(crate) trace_fails: bool,
+    /// Whether traced command buffers are also made with encoder execution status: not with
+    /// `VICTORY_TRACE_GPU_FAILS=names`, which keeps the labels and reports without changing how
+    /// the GPU runs the work (the status option hid a hang that untraced runs showed).
+    pub(crate) encoder_status: bool,
     /// The most passes of a submission in one command buffer (`VICTORY_PASSES_PER_BUFFER`;
     /// default 0: no limit).
     pub(crate) passes_per_buffer: usize,
@@ -52,6 +56,22 @@ pub struct Metal {
     /// The kernel that gates `ExecuteIndirect` records by a count (`gfx.rs`), made at first use.
     pub(crate) gate:
         std::cell::OnceCell<Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String>>,
+    /// `VICTORY_TRACE_GATE=1`: the gates of dispatch records also keep, in this shared buffer, the
+    /// largest record each let run and each stopped (`gfx.rs`, `GATE`), logged once a second.
+    #[allow(clippy::type_complexity)]
+    pub(crate) gate_stats: Option<(Retained<ProtocolObject<dyn MTLBuffer>>, std::cell::Cell<f64>)>,
+    /// `VICTORY_TRACE_GATE=1`: the dispatches encoded since the last commit (`gfx.rs`, `CB_PIPES`).
+    pub(crate) cb_pipes: std::cell::RefCell<Vec<crate::gfx::CbDispatch>>,
+    /// `VICTORY_TRACE_GATE=1`: what the host said each fill about to be encoded writes, by the
+    /// fill's pointer (`ComputeBackend::note_fill`), and the fills encoded since the last commit.
+    pub(crate) fill_notes: std::cell::RefCell<std::collections::HashMap<usize, String>>,
+    pub(crate) cb_fills: std::cell::RefCell<Vec<String>>,
+    /// What heaps let go, kept until the command buffers made before have finished, with the
+    /// work mark then (`gfx.rs`, `Metal::keep_until_done`).
+    #[allow(clippy::type_complexity)]
+    pub(crate) kept_until_done: std::cell::RefCell<
+        std::collections::VecDeque<(u64, Vec<crate::gfx::Res>, Vec<crate::gfx::TextureObject>)>,
+    >,
     /// Every sampler made, by descriptor: a heap entry holds only the sampler's ID, which Metal
     /// hands to a new sampler once the old one is freed. Few distinct descriptors exist.
     #[allow(clippy::type_complexity)]
@@ -121,6 +141,12 @@ pub(crate) fn residency_timed<R>(
 /// Counters of residency work.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct ResidencyCounts {
+    /// Descriptor entries actually written (identical entries do not count).
+    pub entry_writes: u64,
+    /// Heap-set `addAllocation` calls, including the heap buffer at creation.
+    pub set_adds: u64,
+    /// Heap-set `removeAllocation` calls (excludes Drop's `removeAllAllocations`).
+    pub set_removes: u64,
     /// `useResource` calls on title buffers (compute, render and blit encoders).
     pub use_resource: u64,
     /// Resources named to encoders for descriptor heaps without sets.
@@ -183,13 +209,26 @@ pub struct Pipeline(
 pub struct Buffer {
     pub(crate) buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(crate) base: *const u8,
+    /// Long-lived title pools can join the queue residency set. Host tables
+    /// stay encoder-named so each command buffer retains their allocation.
+    pub(crate) pool: bool,
+    /// `buf.gpuAddress()`, asked once (0: not yet): fixed for the buffer's life, and a message
+    /// send per heap entry otherwise.
+    pub(crate) gpu: std::cell::Cell<u64>,
     /// The residency set it is in (so that dropping it leaves the set).
     pub(crate) resident: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
+    /// Texture-buffer views by offset, fitted width, pixel format and writable usage. Metal's
+    /// views retain `buf`, but `buf` does not retain them; the Rust owner is not a retain cycle.
+    pub(crate) views: std::cell::RefCell<std::collections::HashMap<
+        (usize, usize, usize, bool), Retained<ProtocolObject<dyn MTLTexture>>,
+    >>,
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
+        self.views.get_mut().clear();
         if let Some(set) = self.resident.get_mut().take() {
+            let Some(_changes) = crate::gfx::RESIDENCY.changes() else { return };
             set.removeAllocation(ProtocolObject::from_ref(&*self.buf));
             residency_timed("pool_commit", Some(&set), || set.commit());
         }
@@ -277,6 +316,15 @@ impl Metal {
         if dev.respondsToSelector(objc2::sel!(setShouldMaximizeConcurrentCompilation:)) {
             dev.setShouldMaximizeConcurrentCompilation(true);
         }
+        let gate_stats = std::env::var("VICTORY_TRACE_GATE")
+            .is_ok_and(|v| v.trim() == "1")
+            .then(|| dev.newBufferWithLength_options(4 * crate::gfx::GATE_STATS_WORDS, MTLResourceOptions::StorageModeShared))
+            .flatten()
+            .map(|b| {
+                // SAFETY: a new shared buffer of that many bytes.
+                unsafe { std::ptr::write_bytes(b.contents().as_ptr().cast::<u8>(), 0, 4 * crate::gfx::GATE_STATS_WORDS) };
+                (b, std::cell::Cell::new(0.0))
+            });
         Ok(Metal {
             dev,
             msc: Msc::try_open_default().map(std::sync::Arc::new),
@@ -291,6 +339,7 @@ impl Metal {
                 since_start();
                 std::env::var_os("VICTORY_TRACE_GPU_FAILS").is_some()
             },
+            encoder_status: std::env::var("VICTORY_TRACE_GPU_FAILS").map_or(true, |v| v.trim() != "names"),
             passes_per_buffer: std::env::var("VICTORY_PASSES_PER_BUFFER")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -301,6 +350,11 @@ impl Metal {
             trace_enc: Default::default(),
             trace_args: Default::default(),
             gate: Default::default(),
+            gate_stats,
+            cb_pipes: Default::default(),
+            fill_notes: Default::default(),
+            cb_fills: Default::default(),
+            kept_until_done: Default::default(),
             samplers: Default::default(),
         })
     }
@@ -500,6 +554,27 @@ impl ComputeBackend for Metal {
         self.dev.currentAllocatedSize() as u64
     }
 
+    fn work_mark(&self) -> Option<u64> {
+        Some(crate::gfx::work_mark())
+    }
+
+    fn work_done(&self, mark: u64) -> bool {
+        crate::gfx::work_done(mark)
+    }
+
+    fn traces_fills(&self) -> bool {
+        self.gate_stats.is_some()
+    }
+
+    fn note_fill(&self, at: *const u8, what: String) {
+        let mut notes = self.fill_notes.borrow_mut();
+        // Notes of fills never encoded (a dropped pass) must not pile up.
+        if notes.len() >= 4096 {
+            notes.clear();
+        }
+        notes.insert(at as usize, what);
+    }
+
     fn wrap_title_memory(&self, ptr: *mut u8, len: usize) -> Result<Buffer, String> {
         let p = NonNull::new(ptr.cast()).ok_or("null title memory")?;
         // SAFETY: the caller keeps `ptr..ptr+len` mapped while the buffer and its work live.
@@ -516,8 +591,47 @@ impl ComputeBackend for Metal {
         Ok(Buffer {
             buf,
             base: ptr,
+            pool: true,
+            gpu: Default::default(),
             resident: Default::default(),
+            views: Default::default(),
         })
+    }
+
+    fn wrap_title_span(&self, len: usize, pieces: &[(usize, *mut u8, usize)]) -> Result<(Buffer, *mut u8), String> {
+        let (ptr, len) = crate::mem::Stitch::new(len, pieces)?.into_raw();
+        let p = NonNull::new(ptr.cast()).ok_or("null stitched memory")?;
+        // The range is unmapped when Metal lets go of the buffer (work in flight keeps it).
+        let range = (ptr as usize, len);
+        let free = block2::RcBlock::new(move |_: NonNull<std::ffi::c_void>, _: usize| {
+            // SAFETY: the stitch made above, which only this buffer used.
+            unsafe { crate::mem::Stitch::free(range.0 as *mut u8, range.1) };
+        });
+        // SAFETY: `ptr..ptr+len` is mapped until the deallocator runs.
+        let buf = unsafe {
+            self.dev.newBufferWithBytesNoCopy_length_options_deallocator(
+                p,
+                len,
+                MTLResourceOptions::StorageModeShared,
+                Some(&free),
+            )
+        };
+        let Some(buf) = buf else {
+            // SAFETY: no buffer was made over the range.
+            unsafe { crate::mem::Stitch::free(ptr, len) };
+            return Err("newBufferWithBytesNoCopy refused a stitched range".into());
+        };
+        Ok((
+            Buffer {
+                buf,
+                base: ptr,
+                pool: true,
+                gpu: Default::default(),
+                resident: Default::default(),
+                views: Default::default(),
+            },
+            ptr,
+        ))
     }
 
     fn host_buffer(&self, len: usize) -> Result<(Buffer, *mut u8), String> {
@@ -529,7 +643,10 @@ impl ComputeBackend for Metal {
         let buffer = Buffer {
             buf,
             base,
+            pool: false,
+            gpu: Default::default(),
             resident: Default::default(),
+            views: Default::default(),
         };
         Ok((buffer, base))
     }
@@ -553,8 +670,11 @@ impl ComputeBackend for Metal {
                 }
             }
         };
+        let Some(_changes) = crate::gfx::RESIDENCY.changes() else {
+            return Err("GPU residency has stopped".into());
+        };
         let mut joined = false;
-        for b in buffers.iter().filter(|b| !b.is_resident()) {
+        for b in buffers.iter().filter(|b| b.pool && !b.is_resident()) {
             set.addAllocation(ProtocolObject::from_ref(&*b.buf));
             *b.resident.borrow_mut() = Some(set.clone());
             self.count(|c| c.added += 1);
@@ -571,11 +691,16 @@ impl ComputeBackend for Metal {
     }
 
     fn gpu_address(&self, b: &Buffer, title: *const u8) -> u64 {
-        b.buf.gpuAddress() + (title as usize - b.base as usize) as u64
+        let mut gpu = b.gpu.get();
+        if gpu == 0 {
+            gpu = b.buf.gpuAddress();
+            b.gpu.set(gpu);
+        }
+        gpu + (title as usize - b.base as usize) as u64
     }
 
     fn name_pipeline(&self, p: &Pipeline, name: &str) {
-        if self.trace_fails {
+        if self.trace_fails || self.gate_stats.is_some() {
             let key = Retained::as_ptr(&p.0) as *const u8 as usize;
             self.pipe_names.borrow_mut().insert(key, name.to_string());
         }

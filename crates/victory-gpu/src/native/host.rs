@@ -15,10 +15,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::backend::{Dispatch, Heaps, RootArgs};
 use victory_backend::resources::*;
+use super::twin::{self, Twin};
+#[cfg(target_os = "macos")]
+use victory_metal::frame_time::{self, Metric, Timer};
 
 #[cfg(test)]
 thread_local! {
-    /// Walks of the pool table for a wrap's signature ([`NativeHost::alias_signature`]), for tests.
+    /// Signature walks to compare or build direct title wraps, for tests.
     pub(crate) static SIGNATURES: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -29,8 +32,97 @@ type TitleAliases<Buf> = RefCell<HashMap<(u64, u64), (u64, u64, Rc<Buf>)>>;
 /// Buffers in the host's own memory by `(start, key)`: their end and their wrap once made.
 type OwnBuffers<Buf> = RefCell<std::collections::BTreeMap<(u64, usize), (u64, Option<Rc<Buf>>)>>;
 
-pub struct NativeHost<B: GraphicsBackend> {
+type DepthTextures<T> = RefCell<HashMap<usize, (Rc<T>, TextureDesc)>>;
+/// A pool mapping resolved, its buffer, and the mapping's signature if asked for.
+type PoolWay<Buf> = (Mapping, Rc<Buf>, Option<u64>);
+/// Pool mappings resolved last, most recent first, for one pool-table generation: a buffer view
+/// that fits one of them needs no search and no buffer lookup.
+struct PoolHits<Buf> {
+    generation: u64,
+    /// Each with the signature of its mapping ([`super::memory::PoolTable::signature`]), which
+    /// is that of every view the mapping holds; `None` if not asked for.
+    hits: [Option<PoolWay<Buf>>; POOL_WAYS],
+}
+const POOL_WAYS: usize = 4;
+impl<Buf> Default for PoolHits<Buf> {
+    fn default() -> Self {
+        Self { generation: u64::MAX, hits: Default::default() }
+    }
+}
+type PoolHit<Buf> = RefCell<PoolHits<Buf>>;
+
+/// What a table scan found a record to be before mirroring it, decoded under one lock of the
+/// view table for the whole table ([`NativeHost::classify`]).
+#[derive(Clone, Copy, Debug)]
+enum Quick {
+    /// A kind only the general path writes (images, samplers, null and typed buffer views).
+    General,
+    /// No view, or one that decodes to nothing now: the entry keeps what it shows.
+    Nothing { kind: Nothing, words: Option<([u32; 4], u32)> },
+    /// A plain buffer view (constant buffer or raw / structured view that needs no typed view):
+    /// its title range, the resource its stamp follows, and its address and stride words.
+    Buffer { addr: u64, size: u32, key: Option<usize>, constant: bool, words: Option<([u32; 4], u32)> },
+}
+
+/// Why a record decodes to nothing (the kinds of `miss_unknown` before the third pass).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nothing {
+    /// Twelve zero bytes over an entry that was mirrored: the title cleared the record.
+    Empty,
+    /// Bytes that are not a view record.
+    Foreign,
+    /// A record of a view whose resource the title released since.
+    DeadView,
+    /// A view of a resource object the host has not registered (not realized yet, or gone).
+    Unregistered,
+    /// A view the host does not decode (a plain sampler description, an unknown dimension).
+    Unknown,
+}
+type ResolvedBuffer<B> = (Rc<B>, *const u8);
+/// A [`ResolvedBuffer`] with the signature of the title's mappings under it, if followed.
+type FollowedBuffer<B> = (Rc<B>, *const u8, Option<u64>);
+type ResolvedView<B> = (Rc<B>, *const u8, Option<SpanRef>);
+#[cfg(target_os = "macos")]
+type TwinPlane<T> = (usize, usize, Rc<T>, [usize; 3]);
+#[cfg(target_os = "macos")]
+type TwinDepth<T> = (usize, Rc<T>, Rc<T>, [usize; 3]);
+
+#[path = "mirror_cache.rs"]
+mod mirror_cache;
+#[path = "table_clean.rs"]
+mod table_clean;
+pub use mirror_cache::DescriptorBackend;
+
+pub struct NativeHost<B: DescriptorBackend> {
     pub backend: B,
+    cache_mirrors: bool,
+    fast_buffers: bool,
+    /// Heap buffer views one pool run holds are followed when the title's pages under them
+    /// change ([`Self::follow_title_pages`]), unless `VICTORY_FOLLOW_POOL_VIEWS=0`.
+    follow_pool_views: bool,
+    dense_entries: bool,
+    /// Read descriptor records with plain loads where the heap's memory is known readable
+    /// (`VICTORY_RECORD_LOADS=0`, or `VICTORY_DENSE_ENTRIES=0`: always through the kernel).
+    record_loads: bool,
+    /// Counts submission preparations: what a title-placed heap's readability is asked once for.
+    prep_scope: Cell<u64>,
+    /// Scratch of [`Self::remirror_tables`]: each record of the table being scanned and its kind.
+    quick: RefCell<Vec<(usize, [u8; 12], Quick)>>,
+    /// Entries [`Self::mirror_quick`] wrote or settled, for tests.
+    #[cfg(test)]
+    quick_mirrored: Cell<u64>,
+    table_clean: bool,
+    clean_tables: table_clean::CleanTables,
+    last_pool: PoolHit<B::Buffer>,
+    release_generation: Cell<u64>,
+    mirror_cache_limit: usize,
+    // Diagnostic history holds keys/reasons only, never allocations. Absent with tracing off.
+    mirror_misses: RefCell<HashMap<[u8; 12], mirror_cache::Miss>>,
+    #[cfg(target_os = "macos")]
+    cache_working: RefCell<(u64, std::collections::HashSet<[u8; 12]>)>,
+    mirror_cache: RefCell<HashMap<[u8; 12], mirror_cache::CachedMirror<B::Descriptor>>>,
+    #[cfg(target_os = "macos")]
+    trace_mirrors: bool,
     memory: Arc<PoolTable>,
     /// A buffer over each pool, made the first time the GPU needs it.
     buffers: RefCell<HashMap<usize, Rc<B::Buffer>>>,
@@ -40,6 +132,9 @@ pub struct NativeHost<B: GraphicsBackend> {
     maps: RefCell<Option<(u64, Rc<[Mapping]>)>>,
     /// Pools released whose buffers went, not yet taken by [`Self::released_pools`].
     released: RefCell<Vec<usize>>,
+    /// Released pools whose buffers and memory are kept until the work submitted before the host
+    /// heard of the release has finished ([`Self::let_go_of_pools`]).
+    held_pools: RefCell<std::collections::VecDeque<HeldPools<B::Buffer>>>,
     /// The pool-table generation [`Self::follow_title_pages`] last looked at.
     followed: Cell<u64>,
     resources: RefCell<HashMap<usize, Res<Rc<B::Texture>>>>,
@@ -48,17 +143,37 @@ pub struct NativeHost<B: GraphicsBackend> {
     own: OwnBuffers<B::Buffer>,
     /// Counts changes to [`Self::resources`], so unrealized table entries retry once registered.
     resources_epoch: std::cell::Cell<u64>,
+    /// Each live resource key's last change, from `resources_epoch`. Absent keys have version 0;
+    /// a re-registration always gets a fresh nonzero version, even at the same title address.
+    resource_versions: RefCell<HashMap<usize, u64>>,
     /// Textures made without their top levels (`VICTORY_TEXTURE_DROP_TOP_MIP`): key to
     /// (levels dropped, levels the host texture has).
     dropped: RefCell<HashMap<usize, (usize, usize)>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
+    /// Buffers over title ranges that no single run of one pool shows ([`Self::span`]), by their
+    /// 64 KiB aligned start and length.
+    spans: RefCell<HashMap<(usize, usize), Span<B>>>,
+    /// Span buffers whose range the title has mapped differently since, with the submission
+    /// count they were replaced at and the backend's work mark then. The heap entries that showed
+    /// one are written again at the next submission ([`Self::refresh_spans`]); the buffer is kept
+    /// until the work submitted before it was replaced has finished (where the backend cannot tell,
+    /// for [`SPAN_GRACE`] submissions more).
+    retired_spans: RefCell<std::collections::VecDeque<RetiredSpan<B::Buffer>>>,
+    /// The pool-table generation [`Self::refresh_spans`] last ran for.
+    span_generation: std::cell::Cell<u64>,
+    /// Span buffers made so far (each gets the next number as its version).
+    spans_made: std::cell::Cell<u64>,
+    /// Calls of [`Self::execute`] so far.
+    submissions: std::cell::Cell<u64>,
     /// Draws and dispatches dropped because they read a root parameter the title never set.
     unset_roots: std::cell::Cell<u64>,
     /// Draws and clears dropped because none of their targets has a host texture.
     no_targets: std::cell::Cell<u64>,
     /// Commands dropped because they name title memory outside every mapped pool.
     unmapped: std::cell::Cell<u64>,
+    /// With `VICTORY_TRACE_TARGETS`: those commands by kind and error text (at most 512 kinds).
+    unmapped_kinds: RefCell<HashMap<String, u64>>,
     /// Heap entries cleared because the texture they showed was released.
     cleared: std::cell::Cell<u64>,
     /// Commands dropped because the host could not prepare them for another reason.
@@ -73,37 +188,26 @@ pub struct NativeHost<B: GraphicsBackend> {
     /// The same keys always, for the title side to stop filling them from title memory
     /// ([`Self::take_gpu_written`]).
     gpu_written: RefCell<std::collections::HashSet<usize>>,
-    /// Colour twins of depth textures compute writes, by the depth texture's address
-    /// ([`Self::depth_twin`]).
-    twins: RefCell<HashMap<usize, Rc<DepthTwin<B>>>>,
     /// Textures given up under the texture budget (`Title::keep_to_budget`) and not made again.
     evicted: RefCell<std::collections::HashSet<usize>>,
+    /// Covered placed copies stay null until the title places them again. Unlike budget
+    /// evictions, merely reading or copying an old descriptor cannot revive them.
+    covered: RefCell<std::collections::HashSet<usize>>,
     /// Evicted textures an entry's record named since the last [`Self::take_wanted`].
     wanted: RefCell<Vec<usize>>,
     /// Textures a heap entry showed through an unordered access view: what a shader may write,
     /// so the host texture may hold what title memory does not and is never given up.
-    unordered: RefCell<std::collections::HashSet<usize>>,
-}
-
-/// A colour texture standing in for a depth texture that compute writes ([`NativeHost::depth_twin`]).
-/// Metal does not support shader writes to a depth texture, so the title's unordered views of its depth plane,
-/// and its one-channel colour reads made after the first of those, get this twin. The newer
-/// contents move between the two by copies where the use changes ([`NativeHost::twin_copies`]):
-/// into the twin before a compute pass, into the depth texture before a render pass whose depth
-/// target it is. The lighting's material depth is written by compute and tested by draws; the
-/// shadow maps are drawn into and also read by compute.
-pub(crate) struct DepthTwin<B: GraphicsBackend> {
-    depth: std::rc::Weak<B::Texture>,
-    texture: Rc<B::Texture>,
-    /// A buffer the copies go through: Metal copies a depth plane to and from buffers only.
-    stage: Pages<B>,
-    width: usize,
-    height: usize,
-    /// Bytes of a texel of the depth plane, and of the twin: 2 for 16-bit depth, else 4.
-    texel: usize,
-    /// Whether the twin holds the newer contents (a compute pass may have written it since the
-    /// depth texture was last drawn into or cleared); else the depth texture does.
-    twin_newer: Cell<bool>,
+    unordered: RefCell<std::collections::HashSet<usize>>,    /// The depth textures among the title's, by key, as their descriptions say
+    /// ([`Self::register_depth`]).
+    depths: DepthTextures<B::Texture>,
+    /// Their writable twins ([`super::twin`]), each made at the first unordered access view of
+    /// its texture; `None` where the host could make none.
+    twins: RefCell<HashMap<usize, Option<Rc<Twin<B>>>>>,
+    /// Copies between a depth texture and its twin so far, either way.
+    twin_copies: std::cell::Cell<u64>,
+    /// The colour textures that can be render pass attachments ([`Self::register_attachable`]):
+    /// what an unordered access clear can clear.
+    clearable: RefCell<std::collections::HashSet<usize>>,
 }
 
 /// Warns that a dropped command was a fill: a bottom-of-pipe value write, which another queue's
@@ -128,6 +232,64 @@ const NEVER_SET: &str = "was never set";
 const NOT_MAPPED: &str = "is not in a mapped pool";
 
 /// The host's side of the pool-offset contract ([`super::addr`]).
+/// A buffer over a title range whose 64 KiB pages come from several pools, or from places of one
+/// pool that are not next to each other: an alias of those pages side by side
+/// (`ComputeBackend::wrap_title_span`).
+struct Span<B: GraphicsBackend> {
+    buf: Rc<B::Buffer>,
+    /// Where the alias is mapped: title address `start + n` is `base + n`.
+    base: *mut u8,
+    /// What the range showed when the alias was made (`PoolTable::covering`).
+    layout: Vec<(usize, usize, usize, usize)>,
+    /// The pool-table generation the layout was last checked in.
+    generation: u64,
+    /// Which buffer this is of those made for the range: a heap entry written for another one
+    /// shows a buffer since replaced.
+    version: u64,
+}
+
+/// How many submissions a replaced span buffer outlives the rewrite of the heap entries that
+/// showed it, on a backend that cannot tell when submitted work has finished
+/// (`ComputeBackend::work_mark` is `None`). Where it can (Metal), the buffer is kept until the
+/// work submitted before it was replaced has finished, however many submissions that takes: a
+/// count let a buffer go (and its alias be unmapped) while command buffers that read it were
+/// still queued behind held work, and the GPU then faulted on the unmapped pages (docs/hang-notes.md).
+const SPAN_GRACE: u64 = 64;
+
+/// Released pools ([`NativeHost::held_pools`]): the backend's work mark when the host heard of
+/// the release, the buffers that wrapped them, and their ids.
+type HeldPools<Buf> = (Option<u64>, Vec<Rc<Buf>>, Vec<usize>);
+
+/// Whether released pools held with work mark `mark` may go: once the work before the mark has
+/// finished (`done`); at once on a backend that cannot tell (`None`), as before.
+fn pool_may_go(mark: Option<u64>, done: impl FnOnce(u64) -> bool) -> bool {
+    mark.is_none_or(done)
+}
+
+/// A replaced span buffer ([`NativeHost::retired_spans`]): the submission count when it was
+/// replaced, the backend's work mark then, and the buffer.
+type RetiredSpan<Buf> = (u64, Option<u64>, Rc<Buf>);
+
+/// Whether a replaced span buffer retired at submission `at` with work mark `mark` may go at
+/// submission `now`: once the work before `mark` has finished (`done`), or without a mark after
+/// [`SPAN_GRACE`] submissions.
+fn span_may_go(at: u64, mark: Option<u64>, now: u64, done: impl FnOnce(u64) -> bool) -> bool {
+    match mark {
+        Some(mark) => done(mark),
+        None => at + SPAN_GRACE <= now,
+    }
+}
+
+/// The most heap entries with a view of unmapped memory that are tried again when the pool table
+/// changes ([`NativeHost::refresh_spans`]).
+const UNMAPPED_ENTRIES: usize = 4096;
+
+/// A span's key (64 KiB aligned start and length) and the version of its buffer.
+pub(super) type SpanRef = ((usize, usize), u64);
+
+/// The longest title range one span buffer covers.
+const SPAN_LIMIT: usize = 1 << 30;
+
 struct Contract<B: GraphicsBackend> {
     pairs: Pairs,
     /// The memory the null view (pair 0) has, with size 0.
@@ -213,7 +375,74 @@ fn record_at(handle: u64) -> [u8; 12] {
     r
 }
 
-impl<B: GraphicsBackend> NativeHost<B> {
+/// [`record_at`] with a plain load, for a slot of a heap whose memory is known readable
+/// ([`NativeHost::records_readable`]).
+///
+/// # Safety
+/// `handle..handle + 12` is mapped readable. The title may store to it meanwhile, as it may
+/// between any two reads of the kernel path.
+unsafe fn record_loaded(handle: u64) -> [u8; 12] {
+    // SAFETY: the caller's. Volatile: the bytes are the title's, never assumed unchanged.
+    unsafe { (handle as *const [u8; 12]).read_volatile() }
+}
+
+/// Whether two records are the same bytes: two integer compares, not a call.
+#[inline(always)]
+fn same_record(a: &[u8; 12], b: &[u8; 12]) -> bool {
+    let words = |r: &[u8; 12]| {
+        (u64::from_ne_bytes(r[..8].try_into().expect("8 bytes")), u32::from_ne_bytes(r[8..].try_into().expect("4 bytes")))
+    };
+    words(a) == words(b)
+}
+
+/// Descriptor bytes alone do not identify a GPU view: streaming can remap the
+/// same title address to another pool slice without changing the descriptor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MirrorStamp {
+    record: [u8; 12],
+    memory: u64,
+    /// An address-only buffer record naming zero cannot change without a record rewrite.
+    fixed_null: bool,
+    /// The single key this view names and its version. None uses the global epoch instead
+    /// (address-only views, samplers, and UAVs with a separate counter resource).
+    resources: Option<(usize, u64)>,
+    /// Global epoch when the dependency was last checked, so the usual table scan needs no
+    /// descriptor decode or resource-version lookup. Pending mirrors always use this epoch.
+    epoch: Cell<u64>,
+}
+
+impl Nothing {
+    fn of(e: crate::descriptor::RecordError) -> Self {
+        use crate::descriptor::RecordError;
+        match e {
+            RecordError::Empty => Nothing::Empty,
+            RecordError::Foreign => Nothing::Foreign,
+            RecordError::Stale => Nothing::DeadView,
+        }
+    }
+
+    /// Why `view`, which `decode` made nothing of, did not decode.
+    fn undecoded<T>(view: &crate::descriptor::View, resources: &HashMap<usize, Res<T>>) -> Self {
+        use crate::descriptor::View;
+        match view {
+            View::Shader(r, _) | View::Unordered(r, ..) if !resources.contains_key(r) => Nothing::Unregistered,
+            _ => Nothing::Unknown,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn metric(self) -> Metric {
+        match self {
+            Nothing::Empty => Metric::MissEmpty,
+            Nothing::Foreign => Metric::MissForeign,
+            Nothing::DeadView => Metric::MissDeadView,
+            Nothing::Unregistered => Metric::MissUnregistered,
+            Nothing::Unknown => Metric::MissUnknown,
+        }
+    }
+}
+
+impl<B: DescriptorBackend> NativeHost<B> {
     pub fn new(backend: B) -> Self {
         Self::with_memory(backend, Arc::new(PoolTable::default()))
     }
@@ -222,32 +451,255 @@ impl<B: GraphicsBackend> NativeHost<B> {
     pub fn with_memory(backend: B, memory: Arc<PoolTable>) -> Self {
         NativeHost {
             backend,
+            cache_mirrors: std::env::var_os("VICTORY_MIRROR_CACHE").is_none_or(|v| v != "0"),
+            mirror_cache: RefCell::default(),
+            mirror_cache_limit: std::env::var("VICTORY_MIRROR_CACHE_LIMIT").ok().and_then(|n| n.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(mirror_cache::CACHE_LIMIT),
+            mirror_misses: RefCell::default(),
+            #[cfg(target_os = "macos")]
+            cache_working: RefCell::default(),
+            dense_entries: std::env::var("VICTORY_DENSE_ENTRIES").as_deref() != Ok("0"),
+            record_loads: std::env::var("VICTORY_RECORD_LOADS").as_deref() != Ok("0"),
+            prep_scope: Cell::new(0),
+            quick: RefCell::default(),
+            #[cfg(test)]
+            quick_mirrored: Cell::new(0),
+            fast_buffers: std::env::var("VICTORY_BUFFER_FAST").as_deref() != Ok("0"),
+            follow_pool_views: std::env::var("VICTORY_FOLLOW_POOL_VIEWS").as_deref() != Ok("0"),
+            table_clean: std::env::var("VICTORY_TABLE_CLEAN").as_deref() != Ok("0"),
+            clean_tables: Default::default(),
+            last_pool: RefCell::default(),
+            release_generation: Cell::new(u64::MAX),
+            #[cfg(target_os = "macos")]
+            trace_mirrors: frame_time::enabled(),
             memory,
             buffers: RefCell::default(),
             aliases: RefCell::default(),
             released: RefCell::default(),
+            held_pools: RefCell::default(),
             followed: Cell::new(0),
             maps: RefCell::default(),
             resources: RefCell::default(),
             own: RefCell::default(),
             resources_epoch: std::cell::Cell::new(0),
+            resource_versions: RefCell::default(),
             dropped: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
+            spans: RefCell::default(),
+            retired_spans: RefCell::default(),
+            // Not a generation the table has: the first submission checks.
+            span_generation: std::cell::Cell::new(u64::MAX),
+            spans_made: std::cell::Cell::new(0),
+            submissions: std::cell::Cell::new(0),
             unset_roots: std::cell::Cell::new(0),
             no_targets: std::cell::Cell::new(0),
             unmapped: std::cell::Cell::new(0),
+            unmapped_kinds: RefCell::default(),
             cleared: std::cell::Cell::new(0),
             failed: std::cell::Cell::new(0),
             passes: std::cell::Cell::new(0),
             typed_views: std::cell::Cell::new(0),
             written: Default::default(),
             gpu_written: Default::default(),
-            twins: RefCell::default(),
             evicted: Default::default(),
+            covered: Default::default(),
             wanted: Default::default(),
             unordered: Default::default(),
+            depths: RefCell::default(),
+            twins: RefCell::default(),
+            twin_copies: std::cell::Cell::new(0),
+            clearable: RefCell::default(),
         }
+    }
+
+    /// Texture `key` was made a render target: an unordered access clear of it is a render
+    /// pass's load action ([`Self::unordered_clear_target`]).
+    pub fn register_attachable(&self, key: usize) {
+        self.clearable.borrow_mut().insert(key);
+    }
+
+    /// Copies between a depth texture and its writable twin so far ([`super::twin`]).
+    pub fn twin_copies(&self) -> u64 {
+        self.twin_copies.get()
+    }
+
+    /// Texture `key`, registered as `texture`, is a depth texture as `desc` says: an unordered
+    /// access view of it shows a plane of a writable twin instead ([`super::twin`]).
+    pub fn register_depth(&self, key: usize, texture: &Rc<B::Texture>, desc: &TextureDesc) {
+        if super::twin::plane_formats(desc.format).is_some() {
+            self.twins.borrow_mut().remove(&key);
+            self.depths.borrow_mut().insert(key, (texture.clone(), *desc));
+            self.resources_changed(key);
+        }
+    }
+
+    /// Plane `plane` of the twin of depth texture `key`, if it has one (tests read it back).
+    #[cfg(test)]
+    #[cfg(target_os = "macos")]
+    pub(crate) fn twin_plane_of(&self, key: usize, plane: usize) -> Option<Rc<B::Texture>> {
+        Some(self.twins.borrow().get(&key)?.as_ref()?.planes.get(plane)?.texture.clone())
+    }
+
+    /// What an unordered access clear of `view` clears: the level of a texture the view names
+    /// (the plane of its twin, for a depth texture), as an attachment, with a description for
+    /// traces; or a buffer view's range. A texture the host has not realized gives `None`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn unordered_clear_target(&self, view: &crate::descriptor::View) -> Option<(ClearTarget<B>, String, (u32, u32))> {
+        let resources = self.resources.borrow();
+        match decode(view, &resources)? {
+            Decoded::Buffer { addr, size, .. } => Some((ClearTarget::Buffer(addr, size as usize), "buffer".into(), (size, 0))),
+            Decoded::Image { resource, mips, .. } => {
+                let Some(Res::Texture(texture)) = resources.get(&resource) else { return None };
+                let texture = texture.clone();
+                let info = texture_info_of(resource);
+                let (format, size) = info.map_or((0, (0, 0)), |i| (i.format, (i.width, i.height)));
+                if let Some((plane, _)) = self.twin_plane(resource, &texture, view) {
+                    return Some((ClearTarget::Texture(plane), format!("depth twin of format {format}"), size));
+                }
+                if self.depths.borrow().contains_key(&resource) {
+                    return None;
+                }
+                // shortcut: only a texture that is also a render target can be an attachment;
+                // one that is unordered access alone is not cleared (a blit from a filled
+                // buffer would do it). Upgrade when a title's clear of such a texture is seen
+                // (`glue::clear_unordered` warns once).
+                if !self.clearable.borrow().contains(&resource) {
+                    return None;
+                }
+                let mip = mips.map_or(0, |m| m.0 as usize);
+                let target = if mip == 0 {
+                    texture
+                } else {
+                    let own = info_format(resource)?;
+                    Rc::new(self.backend.create_texture_view(&texture, &ViewDesc { format: own, mips: (mip, 1), slices: (0, usize::MAX) }).ok()?)
+                };
+                Some((ClearTarget::Texture(target), format!("texture of format {format} level {mip}"), size))
+            }
+            Decoded::Sampler { .. } => None,
+        }
+    }
+
+    /// The title texture the table bound at root `slot` shows at `entry` (debugging).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn table_texture(&self, root: &[Option<Root<B>>], slot: usize, entry: usize) -> Option<usize> {
+        let Some(Some(Root::Table(h, at))) = root.get(slot) else { return None };
+        if h.kind != HeapKind::Resource || at + entry >= h.count {
+            return None;
+        }
+        match crate::descriptor::view(h.start + (at + entry) as u64 * Self::step(h.kind))? {
+            crate::descriptor::View::Shader(r, Some(d)) | crate::descriptor::View::Unordered(r, _, Some(d)) if d[1] != 1 => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Every twin plane there is: its depth texture's key, the plane's index, its texture, and
+    /// the texture's width, height and bytes a texel (for traces).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn twin_planes(&self) -> Vec<TwinPlane<B::Texture>> {
+        let depths = self.depths.borrow();
+        let mut out = Vec::new();
+        for (key, twin) in self.twins.borrow().iter() {
+            let (Some(twin), Some((_, desc))) = (twin, depths.get(key)) else { continue };
+            let formats = twin::plane_formats(desc.format).unwrap_or(&[]);
+            for (i, p) in twin.planes.iter().enumerate() {
+                out.push((*key, i, p.texture.clone(), [desc.width, desc.height, formats.get(i).map_or(0, |f| f.1)]));
+            }
+        }
+        out
+    }
+
+    /// Every twin's depth texture with its key, the twin's depth plane, and the width, height
+    /// and bytes a texel of that plane (for traces).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn twin_depths(&self) -> Vec<TwinDepth<B::Texture>> {
+        let depths = self.depths.borrow();
+        let mut out = Vec::new();
+        for (key, twin) in self.twins.borrow().iter() {
+            let (Some(twin), Some((_, desc))) = (twin, depths.get(key)) else { continue };
+            let bytes = twin::plane_formats(desc.format).and_then(|f| f.first()).map_or(0, |f| f.1);
+            if let Some(p) = twin.planes.first() {
+                out.push((*key, twin.depth.clone(), p.texture.clone(), [desc.width, desc.height, bytes]));
+            }
+        }
+        out
+    }
+
+    /// A view of a depth plane: unordered views create a writable twin, and later colour
+    /// reads share it. All resource keys backed by one host texture share one plane-aware twin.
+    /// Depth-format reads stay on the depth texture. `VICTORY_DEPTH_TWINS=0` disables twins.
+    fn twin_plane(&self, resource: usize, depth: &Rc<B::Texture>, view: &crate::descriptor::View) -> Option<(Rc<B::Texture>, Format)> {
+        use crate::descriptor::View;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_DEPTH_TWINS").is_none_or(|v| v != "0")) {
+            return None;
+        }
+        let (unordered, d): (bool, &[u32]) = match view {
+            View::Unordered(_, _, Some(d)) => (true, d),
+            View::Shader(_, Some(d)) => (false, d),
+            View::Placed(unordered, _, d) => (*unordered, d),
+            _ => return None,
+        };
+        let (mip, plane) = if unordered { (d[2], d[3]) } else { (d[4], d[6]) };
+        if d[1] != 4 || mip != 0 {
+            return None;
+        }
+        // Only these view formats can show a plane (the match below), and a view in a depth
+        // format still registers its texture as before; checked first, so a colour texture's
+        // view (most of a frame's image entries) does not read the title's resource description,
+        // which costs tens of microseconds, at every mirror (derz92, on pull request 437).
+        let requested = super::descriptors::format(d[0])?;
+        if !(requested.is_depth()
+            || matches!(
+                requested,
+                Format::R32Float | Format::R32Uint | Format::R16Unorm | Format::R16Uint | Format::R8Uint
+            ))
+        {
+            return None;
+        }
+        if !self.depths.borrow().contains_key(&resource) {
+            let desc = texture_info_of(resource)?.desc()?;
+            self.register_depth(resource, depth, &desc);
+        }
+        let desc = self.depths.borrow().get(&resource)?.1;
+        let physical = twin::plane_formats(desc.format)?.get(plane as usize)?.0;
+        let format = match (physical, requested) {
+            (Format::R32Float, Format::R32Float | Format::R32Uint)
+            | (Format::R16Unorm, Format::R16Unorm | Format::R16Uint)
+            | (Format::R8Uint, Format::R8Uint) => requested,
+            // The console's 16-bit depth with stencil is held as host float depth.
+            (Format::R32Float, Format::R16Unorm) => Format::R32Float,
+            _ => return None,
+        };
+        let known = self.twins.borrow().values().flatten().find(|t| Rc::ptr_eq(&t.depth, depth)).cloned();
+        let twin = if let Some(twin) = known {
+            twin
+        } else {
+            if !unordered || self.twins.borrow().contains_key(&resource) {
+                return None;
+            }
+            let made = match Twin::new(&self.backend, depth, &desc) {
+                Ok(t) => {
+                    tracing::info!(format = ?desc.format, width = desc.width, height = desc.height, planes = t.planes.len(), mips = desc.mips, layers = desc.depth_or_layers, "a writable twin for a depth texture");
+                    Rc::new(t)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, ?desc, "no writable twin for a depth texture: its unordered writes are lost");
+                    self.twins.borrow_mut().insert(resource, None);
+                    return None;
+                }
+            };
+            // Colour reads mirrored before the first UAV must now follow the twin too,
+            // including resource aliases that share this host texture.
+            for (&key, res) in self.resources.borrow().iter() {
+                if matches!(res, Res::Texture(t) if Rc::ptr_eq(t, depth)) {
+                    self.resources_changed(key);
+                }
+            }
+            made
+        };
+        let texture = twin.planes.get(plane as usize)?.texture.clone();
+        self.twins.borrow_mut().insert(resource, Some(twin));
+        Some((texture, format))
     }
 
     /// Draws and clears dropped so far because none of their targets has a host texture.
@@ -263,6 +715,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// Commands dropped so far because they name title memory outside every mapped pool.
     pub fn unmapped(&self) -> u64 {
         self.unmapped.get()
+    }
+
+    /// With `VICTORY_TRACE_TARGETS=1`: the `n` kinds of commands dropped most often at unmapped
+    /// title memory so far (kind and error text, with their counts), and how many kinds there are.
+    pub fn unmapped_kinds(&self, n: usize) -> (usize, Vec<(u64, String)>) {
+        let kinds = self.unmapped_kinds.borrow();
+        let mut top: Vec<(u64, String)> = kinds.iter().map(|(k, &c)| (c, k.clone())).collect();
+        top.sort_unstable_by(|a, b| b.cmp(a));
+        top.truncate(n);
+        (kinds.len(), top)
     }
 
     /// Commands dropped so far because the host could not prepare them (not an unset root
@@ -308,10 +770,276 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.forget_released();
         match self.memory.resolve(addr, len) {
             Some((pool, ptr)) => Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr)),
-            None => self
-                .own_buffer(addr, len)
-                .ok_or_else(|| format!("title address {addr:#x}+{len:#x} {NOT_MAPPED}")),
+            None => self.own_buffer(addr, len)
+                .map_or_else(|| self.span(addr, len).map(|(buf, ptr, _)| (buf, ptr)), Ok),
         }
+    }
+
+    /// [`Self::resolve`] for a heap entry: also the span the view is shown through, if it is
+    /// (its key and the buffer's version), for [`Self::refresh_spans`].
+    fn resolve_view(&self, addr: u64, len: u64) -> Result<ResolvedView<B::Buffer>, String> {
+        self.forget_released();
+        if self.fast_buffers && let Some((buf, ptr)) = self.resolve_pool_cached(addr, len)? {
+            return Ok((buf, ptr, None));
+        }
+        match self.memory.resolve(addr, len) {
+            Some((pool, ptr)) => Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr, None)),
+            None => self.own_buffer(addr, len)
+                .map_or_else(|| self.span(addr, len).map(|(buf, ptr, at)| (buf, ptr, Some(at))), |(buf, ptr)| Ok((buf, ptr, None))),
+        }
+    }
+
+    /// The usual buffer view fits one mapping. Reuse its pool wrap without a mutex or hash
+    /// lookup; otherwise binary-search the existing immutable, generation-tagged snapshot.
+    fn resolve_pool_cached(&self, addr: u64, len: u64) -> Result<Option<ResolvedBuffer<B::Buffer>>, String> {
+        Ok(self.resolve_pool_followed(addr, len)?.map(|(buf, ptr, _)| (buf, ptr)))
+    }
+
+    /// [`Self::resolve_pool_cached`], with the signature of the title's mappings under the view
+    /// ([`Self::alias_signature`]) for [`Self::follow_title_pages`]: the one mapping's, kept with
+    /// the mapping, where the view's pages are all in it (one walk of the pool table a mapping
+    /// and pool-table generation, not one a view). `None` with `VICTORY_FOLLOW_POOL_VIEWS=0`.
+    fn resolve_pool_followed(&self, addr: u64, len: u64) -> Result<Option<FollowedBuffer<B::Buffer>>, String> {
+        let Some(end) = addr.checked_add(len.max(1)) else { return Ok(None) };
+        let generation = self.memory.generation();
+        let fits = |m: &Mapping| m.at <= addr && end <= m.at.saturating_add(m.len);
+        // The signature of a view `m` holds: `m`'s own where the view's pages are all in `m`.
+        let signature = |m: &Mapping, of_mapping: Option<u64>| {
+            if !self.follow_pool_views { return None; }
+            match Self::alias_range(addr, len) {
+                Some((base, end)) if m.at <= base && end <= m.at.saturating_add(m.len) => of_mapping,
+                _ => self.alias_signature(addr, len),
+            }
+        };
+        // The reference remembers one mapping; a ring heap's views alternate over a few pools.
+        let ways = if self.dense_entries { POOL_WAYS } else { 1 };
+        {
+            let mut last = self.last_pool.borrow_mut();
+            if last.generation == generation {
+                for i in 0..ways {
+                    if let Some((m, buf, sig)) = &last.hits[i]
+                        && fits(m)
+                    {
+                        let found = (buf.clone(), (m.base as u64 + m.offset + addr - m.at) as *const u8, signature(m, *sig));
+                        if i != 0 { last.hits.swap(0, i); }
+                        #[cfg(target_os = "macos")]
+                        if self.trace_mirrors { frame_time::count(Metric::PoolLast, 1); }
+                        return Ok(Some(found));
+                    }
+                }
+            }
+        }
+        let (generation, maps) = self.mapping_list();
+        let Some(i) = maps.partition_point(|m| m.at <= addr).checked_sub(1) else { return Ok(None) };
+        let m = maps[i];
+        if !fits(&m) { return Ok(None); } // multi-mapping runs/spans use the established resolver
+        let buf = self.pool_buffer(m.pool, m.base, m.pool_len as usize)?;
+        let ptr = (m.base as u64 + m.offset + addr - m.at) as *const u8;
+        let of_mapping = if self.follow_pool_views { self.memory.signature(m.at, m.len) } else { None };
+        let mut last = self.last_pool.borrow_mut();
+        if last.generation != generation {
+            *last = PoolHits { generation, hits: Default::default() };
+        }
+        last.hits[..ways].rotate_right(1);
+        last.hits[0] = Some((m, buf.clone(), of_mapping));
+        #[cfg(target_os = "macos")]
+        if self.trace_mirrors { frame_time::count(Metric::PoolSearch, 1); }
+        Ok(Some((buf, ptr, signature(&m, of_mapping))))
+    }
+
+    /// Brings what heap entries show of title memory up to the pool table, once per change of it
+    /// (every submission starts here; nothing changed is one comparison). A heap entry is written
+    /// when the title writes its record or a bound table is checked, but a shader also loads
+    /// entries no table binds (the culling shaders' scene buffer), and the title maps pages into
+    /// such a view's range long after it wrote the record. So when the table changed:
+    /// - each span's layout is compared with the range as it is mapped now, and the entries that
+    ///   show a span whose layout changed, or a buffer since replaced, are mirrored again (which
+    ///   makes the span again, [`Self::span`]);
+    /// - entries left with the null view because their memory was not mapped are tried again;
+    /// - a span no entry was written for again is dropped, and replaced buffers past
+    ///   [`SPAN_GRACE`] are let go.
+    fn refresh_spans(&self) {
+        #[cfg(target_os = "macos")]
+        let _refresh = Timer::new(Metric::RefreshSpans);
+        let now = self.submissions.get();
+        {
+            let mut retired = self.retired_spans.borrow_mut();
+            // Marks only grow, so the oldest goes first.
+            while retired.front().is_some_and(|&(at, mark, _)| span_may_go(at, mark, now, |m| self.backend.work_done(m))) {
+                retired.pop_front();
+            }
+            // What the count alone would have let go here while work that may read it is queued.
+            if let Some(&(at, Some(_), _)) = retired.front()
+                && at + SPAN_GRACE <= now
+            {
+                static LATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = LATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 16 || n.is_power_of_two() {
+                    tracing::info!(
+                        submissions = now - at,
+                        kept = retired.len(),
+                        times = n,
+                        "a replaced span buffer outlives the 64-submission count: work submitted before it has not finished"
+                    );
+                }
+            }
+        }
+        let generation = self.memory.generation();
+        if self.span_generation.get() == generation {
+            return;
+        }
+        self.span_generation.set(generation);
+        self.mirror_cache.borrow_mut().retain(|record, c| {
+            let keep = c.current_memory(generation);
+            self.note_cache_removal(*record, keep);
+            keep
+        });
+        // The spans whose range is mapped differently now (their buffers show the old pages).
+        let mut stale: Vec<(usize, usize)> = Vec::new();
+        let mut versions: HashMap<(usize, usize), u64> = HashMap::new();
+        for (&k, s) in self.spans.borrow_mut().iter_mut() {
+            if s.generation != generation {
+                if self.memory.covering(k.0, k.0 + k.1) == s.layout {
+                    s.generation = generation;
+                } else {
+                    stale.push(k);
+                    continue;
+                }
+            }
+            versions.insert(k, s.version);
+        }
+        let heaps: Vec<Rc<NativeHeap<B>>> = self.heaps.borrow().clone();
+        let mut again = 0usize;
+        for heap in heaps.iter().filter(|h| h.kind == HeapKind::Resource) {
+            let mut entries: Vec<usize> = heap
+                .spanned
+                .borrow()
+                .iter()
+                .filter(|&(_, &(key, version))| versions.get(&key) != Some(&version))
+                .map(|(i, _)| i)
+                .collect();
+            entries.extend(heap.unmapped.borrow().iter().copied());
+            entries.sort_unstable();
+            let step = Self::step(heap.kind);
+            for index in entries {
+                again += 1;
+                if let Err(e) = self.mirror(heap.start + index as u64 * step) {
+                    tracing::debug!(error = %e, index, "a heap entry was not mirrored when title memory changed");
+                }
+            }
+        }
+        // What no entry asked for again shows nothing any more (its range starts unmapped now, or
+        // the title's records moved on).
+        let mut spans = self.spans.borrow_mut();
+        let mut dropped = 0usize;
+        for k in &stale {
+            if spans.get(k).is_some_and(|s| s.generation != generation && self.memory.covering(k.0, k.0 + k.1) != s.layout)
+                && let Some(old) = spans.remove(k)
+            {
+                dropped += 1;
+                self.retired_spans.borrow_mut().push_back((now, self.backend.work_mark(), old.buf));
+            }
+        }
+        if !stale.is_empty() {
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 64 || n.is_power_of_two() {
+                tracing::info!(
+                    remapped = stale.len(),
+                    entries = again,
+                    dropped,
+                    spans = spans.len(),
+                    kept = self.retired_spans.borrow().len(),
+                    times = n,
+                    "title ranges shown through buffers of their own were mapped differently: their heap entries are written again"
+                );
+            }
+        }
+    }
+
+    /// The buffer and address of `[addr, addr + len)` where no single run of one pool shows it:
+    /// a title maps 64 KiB physical pages into its reservations in any order and makes buffer
+    /// views across them (the scene buffer its culling shaders take from the resource heap is
+    /// one view of 174 MiB over a whole arena). The range's pages, as they are mapped now, are
+    /// shown side by side in an alias of their own, which one buffer wraps; pages the title has
+    /// not mapped read as zeros. The alias is made again when the title maps the range
+    /// differently. `addr` itself must be mapped: a view of nothing stays unmapped.
+    ///
+    /// A buffer whose range was remapped is replaced here; the heap entries that still show the
+    /// old one are found and written again by [`Self::refresh_spans`] before the next submission.
+    /// Also returns the span's key and the buffer's version.
+    fn span(&self, addr: u64, len: u64) -> Result<(Rc<B::Buffer>, *const u8, SpanRef), String> {
+        const PAGE: usize = 1 << 16;
+        let unmapped = || format!("title address {addr:#x}+{len:#x} {NOT_MAPPED}");
+        let (Ok(a), Ok(n)) = (usize::try_from(addr), usize::try_from(len.max(1))) else {
+            return Err(unmapped());
+        };
+        let Some(last) = a.checked_add(n).and_then(|e| e.checked_add(PAGE - 1)) else {
+            return Err(unmapped());
+        };
+        let generation = self.memory.generation();
+        let mut spans = self.spans.borrow_mut();
+        // A span made for a longer view (the arena's) serves the views inside it.
+        let holder = spans
+            .iter()
+            .find(|(k, _)| k.0 <= a && a + n <= k.0 + k.1)
+            .map(|(&k, _)| k);
+        let (start, size) = holder.unwrap_or((a & !(PAGE - 1), (last & !(PAGE - 1)) - (a & !(PAGE - 1))));
+        if size > SPAN_LIMIT {
+            return Err(unmapped());
+        }
+        if let Some(s) = spans.get(&(start, size))
+            && s.generation == generation
+        {
+            return Ok((s.buf.clone(), s.base.wrapping_add(a - start).cast_const(), ((start, size), s.version)));
+        }
+        let layout = self.memory.covering(start, start + size);
+        // Spans implement the pool-offset contract's whole 64 KiB title pages. A smaller
+        // mapping is not one of those pages: heap views may still use a direct title wrap,
+        // but a gap in that wrap must leave the whole view null, not become a partial span.
+        // Pool bases need only be host-page aligned; their absolute addresses are not title VAs.
+        if layout.iter().any(|&(at, n, ..)| !(at - start).is_multiple_of(PAGE) || !n.is_multiple_of(PAGE)) {
+            return Err(unmapped());
+        }
+        if !layout.iter().any(|&(at, n, ..)| at <= a && a < at + n) {
+            return Err(unmapped());
+        }
+        if let Some(s) = spans.get_mut(&(start, size))
+            && s.layout == layout
+        {
+            s.generation = generation;
+            return Ok((s.buf.clone(), s.base.wrapping_add(a - start).cast_const(), ((start, size), s.version)));
+        }
+        let pieces: Vec<(usize, *mut u8, usize)> =
+            layout.iter().map(|&(at, n, _, from)| (at - start, from as *mut u8, n)).collect();
+        // A backend without such buffers leaves the range as unreachable as it was (the command
+        // is dropped and counted with the unmapped ones).
+        let (buf, base) = self.backend.wrap_title_span(size, &pieces).map_err(|e| {
+            tracing::debug!(error = %e, "no buffer over a title range of several pool runs");
+            unmapped()
+        })?;
+        let buf = Rc::new(buf);
+        let mapped: usize = layout.iter().map(|p| p.1).sum();
+        let mut pools: Vec<usize> = layout.iter().map(|p| p.2).collect();
+        pools.sort_unstable();
+        pools.dedup();
+        let made = self.spans_made.get() + 1;
+        self.spans_made.set(made);
+        if made <= 64 || made.is_power_of_two() {
+            tracing::info!(
+                start = format!("{start:#x}"),
+                size = format!("{size:#x}"),
+                mapped = format!("{mapped:#x}"),
+                pieces = pieces.len(),
+                pools = pools.len(),
+                made,
+                "a title range over several pool runs is shown through a buffer of its own"
+            );
+        }
+        if let Some(old) = spans.insert((start, size), Span { buf: buf.clone(), base, layout, generation, version: made }) {
+            self.retired_spans.borrow_mut().push_back((self.submissions.get(), self.backend.work_mark(), old.buf));
+        }
+        Ok((buf, base.wrapping_add(a - start).cast_const(), ((start, size), made)))
     }
 
     /// The wrap of the host-memory buffer ([`Self::register_own_buffer`]) holding all of
@@ -338,6 +1066,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// Drops what the host keeps of pools released since the last call: their buffers, and their
     /// view pairs (free for other pools from now on). [`Self::released_pools`] lists them.
     fn forget_released(&self) {
+        let generation = self.memory.generation();
+        if self.release_generation.replace(generation) == generation { return; }
         let gone = self.memory.take_released();
         if gone.is_empty() {
             return;
@@ -347,13 +1077,41 @@ impl<B: GraphicsBackend> NativeHost<B> {
         // (dropping them all made a new 174 MB wrap at each release, while the old ones stayed
         // alive in the heap entries and in-flight work: Metal's count rose by gigabytes).
         self.aliases.borrow_mut().retain(|&(base, end), (sig, _, _)| self.memory.signature(base, end - base) == Some(*sig));
-        let mut buffers = self.buffers.borrow_mut();
-        let mut c = self.contract.borrow_mut();
-        for &id in &gone {
-            buffers.remove(&id);
-            c.pairs.release(id);
+        *self.last_pool.borrow_mut() = Default::default();
+        let mut kept = Vec::new();
+        {
+            let mut buffers = self.buffers.borrow_mut();
+            let mut c = self.contract.borrow_mut();
+            for &id in &gone {
+                kept.extend(buffers.remove(&id));
+                c.pairs.release(id);
+            }
         }
+        self.held_pools.borrow_mut().push_back((self.backend.work_mark(), kept, gone.clone()));
         self.released.borrow_mut().extend(gone);
+        self.let_go_of_pools();
+    }
+
+    /// Lets go of released pools once the work submitted before the host heard of their release
+    /// has finished: their buffers, and the pools' own mappings (`memory::let_go_of_pool`, which
+    /// unmaps them). A buffer over a pool is reached by heap entries and the residency set, which
+    /// retain nothing, so work queued behind slow frames could still write a pool the title had
+    /// freed; the GPU then faulted on the unmapped pages ("MMU interrupt", docs/hang-notes.md).
+    fn let_go_of_pools(&self) {
+        loop {
+            let gone = {
+                let mut held = self.held_pools.borrow_mut();
+                match held.front() {
+                    Some(&(mark, ..)) if pool_may_go(mark, |m| self.backend.work_done(m)) => held.pop_front(),
+                    _ => None,
+                }
+            };
+            let Some((_, buffers, ids)) = gone else { break };
+            drop(buffers);
+            for id in ids {
+                super::memory::let_go_of_pool(id);
+            }
+        }
     }
 
     /// Pools released since the last call (for what the title side keeps of them).
@@ -382,7 +1140,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         const KEPT: usize = 64;
         static USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (base, end) = Self::alias_range(addr, len)?;
-        let Some(sig) = self.memory.signature(base, end - base) else {
+        let Some(sig) = self.alias_signature(base, end - base) else {
             // A real gap: the title maps nothing at part of the view. It stays the null view.
             static GAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if GAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
@@ -500,7 +1258,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 .title_views
                 .borrow()
                 .iter()
-                .filter_map(|(&index, &(addr, len, was))| {
+                .filter_map(|(index, &(addr, len, was))| {
                     let now = match Self::alias_range(addr, len) {
                         Some(range) => *walked.entry(range).or_insert_with(|| self.alias_signature(addr, len)),
                         None => None,
@@ -526,6 +1284,61 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 }
             }
         }
+    }
+
+    /// What the host keeps besides texture copies, for `VICTORY_TRACE_MEMORY`: buffers over pools
+    /// (they wrap title memory: no memory of their own), span buffers and wraps of the title's
+    /// own pages (aliases of title pages: no memory of their own either), the host's own buffers
+    /// (committed and heap-placed resources: memory of their own), released pools still held for
+    /// work in flight, depth textures and twins, and Metal's whole count.
+    pub(crate) fn buffer_breakdown(&self) -> String {
+        let mib = |b: u64| b >> 20;
+        let pools = self.buffers.borrow().len();
+        let tables = self.memory.mappings().1;
+        let mut pool_lens: HashMap<usize, usize> = HashMap::new();
+        for (_, _, p, _) in &tables {
+            pool_lens.insert(p.id, p.len);
+        }
+        let pool_bytes: u64 = pool_lens.values().map(|&l| l as u64).sum();
+        let spans = self.spans.borrow();
+        let span_bytes: u64 = spans.keys().map(|&(_, size)| size as u64).sum();
+        let retired = self.retired_spans.borrow().len();
+        let aliases = self.aliases.borrow();
+        let alias_bytes: u64 = aliases.keys().map(|&(b, e)| e - b).sum();
+        let own = self.own.borrow();
+        let own_bytes: u64 = own.iter().map(|(&(start, _), &(stop, _))| stop - start).sum();
+        let own_wrapped = own.values().filter(|(_, w)| w.is_some()).count();
+        let held = self.held_pools.borrow();
+        let held_pools: usize = held.iter().map(|(_, _, ids)| ids.len()).sum();
+        let depths = self.depths.borrow();
+        let depth_bytes: u64 = depths.values().map(|(t, _)| self.backend.texture_bytes(t)).sum();
+        let twins = self.twins.borrow();
+        let twin_bytes: u64 = twins.values().flatten().map(|t| self.backend.texture_bytes(&t.depth)).sum();
+        format!(
+            "metal allocated {} MiB; title pools mapped {} ({} MiB), wrapped {pools}; span buffers {} ({} MiB of title pages), replaced and kept {retired}; wraps of title pages {} ({} MiB); host buffers {} ({} MiB, {own_wrapped} wrapped); released pools held for work in flight {held_pools} in {} batches; depth textures {} ({} MiB), twins {} ({} MiB)",
+            mib(self.backend.allocated_bytes()),
+            pool_lens.len(), mib(pool_bytes),
+            spans.len(), mib(span_bytes),
+            aliases.len(), mib(alias_bytes),
+            own.len(), mib(own_bytes),
+            held.len(),
+            depths.len(), mib(depth_bytes),
+            twins.values().flatten().count(), mib(twin_bytes),
+        )
+    }
+
+    /// Where title range `[addr, addr + len)` lies now, for diagnostics: its pool and offset, the
+    /// span buffer that shows it, or neither.
+    fn describe_title(&self, addr: u64, len: usize) -> String {
+        if let Some((pool, ptr)) = self.memory.resolve(addr, len as u64) {
+            return format!("title {addr:#x}+{len} pool {} (len {:#x}) off {:#x}", pool.id, pool.len, ptr as usize - pool.base);
+        }
+        let a = addr as usize;
+        let spans = self.spans.borrow();
+        if let Some((&(start, size), s)) = spans.iter().find(|&(&(start, size), _)| a >= start && a + len <= start + size) {
+            return format!("title {addr:#x}+{len} span {start:#x}+{size:#x} v{} off {:#x}", s.version, a - start);
+        }
+        format!("title {addr:#x}+{len} own or unknown memory")
     }
 
     /// The buffer over pool `id`, made the first time the GPU needs it.
@@ -562,212 +1375,35 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.backend.create_texture(desc).map(Rc::new)
     }
 
-    /// The colour twin of depth texture `depth` (title texture `resource`) that a view of format
-    /// `format` shows instead of it, and the format of that view; made at the first unordered view
-    /// of the depth plane. `None` for views that stay on the depth texture: depth formats, formats
-    /// other than the one-channel 16- and 32-bit ones a depth plane takes, any view before the
-    /// first unordered one, and every view with `VICTORY_DEPTH_TWINS=0`.
-    ///
-    /// The lighting's material depth (1280x720, DXGI 118, the console's `D16_UNORM_S8_UINT`) is
-    /// written by compute through `R16_UNORM` views of its depth plane and `R8_UINT` views of its
-    /// stencil plane, then tested equal by the tiled light draws. A view of the depth texture
-    /// itself let compute write it, but Metal does not support shader writes to a depth texture:
-    /// a blit reads them, a later render pass's depth test does not (M4 Pro; the test
-    /// `a_draw_tests_against_the_depth_compute_wrote_through_an_unordered_view`).
-    /// The host keeps that format as 32-bit float depth with stencil, so an `R16_UNORM` view of
-    /// it writes the twin as 32-bit floats. Guess: the title writes `k / 65535` there, the very
-    /// float its draws rasterise (VIctory's D3D12 path converts `k` to `k * 0x37800080`). A
-    /// 16-bit depth texture (`D16Unorm`: the shadow maps) has a 16-bit twin, copied bit for bit.
-    fn depth_twin(&self, resource: usize, depth: &Rc<B::Texture>, format: Format, unordered: bool) -> Option<(Rc<B::Texture>, Format)> {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_DEPTH_TWINS").is_none_or(|v| v != "0")) {
-            return None;
-        }
-        if !matches!(format, Format::R32Float | Format::R32Uint | Format::R16Unorm | Format::R16Uint) {
-            return None;
-        }
-        let view_on = |texel: usize| match (texel, format) {
-            (2, Format::R16Unorm | Format::R16Uint) | (4, Format::R32Float | Format::R32Uint) => Some(format),
-            (4, Format::R16Unorm) => Some(Format::R32Float),
-            _ => None,
-        };
-        let at = Rc::as_ptr(depth) as usize;
-        let known = self
-            .twins
-            .borrow()
-            .get(&at)
-            .filter(|t| t.depth.upgrade().is_some_and(|d| Rc::ptr_eq(&d, depth)))
-            .map(|t| (t.texture.clone(), t.texel));
-        if let Some((texture, texel)) = known {
-            return view_on(texel).map(|v| (texture, v));
-        }
-        if !unordered {
-            return None;
-        }
-        let info = texture_info_of(resource)?;
-        let desc = info.desc()?;
-        if !desc.format.is_depth() || desc.dim != TexDim::D2 {
-            return None;
-        }
-        let (texel, twin_format) = if desc.format == Format::D16Unorm { (2, Format::R16Unorm) } else { (4, Format::R32Float) };
-        let view = view_on(texel)?;
-        let texture = self
-            .texture(&TextureDesc {
-                dim: TexDim::D2,
-                format: twin_format,
-                width: desc.width,
-                height: desc.height,
-                depth_or_layers: 1,
-                mips: 1,
-                render_target: false,
-                unordered_access: true,
-            })
-            .ok()?;
-        let stage = Pages::new(&self.backend, desc.width * desc.height * texel).ok()?;
-        tracing::info!(format = info.format, w = desc.width, h = desc.height, "a depth texture compute writes gets a colour twin");
-        let twin = DepthTwin {
-            depth: Rc::downgrade(depth),
-            texture: texture.clone(),
-            stage,
-            width: desc.width,
-            height: desc.height,
-            texel,
-            twin_newer: Cell::new(false),
-        };
-        self.twins.borrow_mut().insert(at, Rc::new(twin));
-        // Entries mirrored before still show the depth texture: they are mirrored again, so that
-        // colour reads of the depth plane read the twin.
-        for heap in self.heaps.borrow().iter() {
-            for index in heap.take_entries(resource) {
-                heap.mirrored.borrow_mut().remove(&index);
-            }
-        }
-        Some((texture, view))
-    }
-
-    /// The colour twin of depth texture `depth`, if it has one.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn twin_of(&self, depth: &Rc<B::Texture>) -> Option<Rc<B::Texture>> {
-        let twins = self.twins.borrow();
-        let twin = twins.get(&(Rc::as_ptr(depth) as usize))?;
-        twin.depth.upgrade().is_some_and(|d| Rc::ptr_eq(&d, depth)).then(|| twin.texture.clone())
+        self.twins.borrow().values().flatten().find(|t| Rc::ptr_eq(&t.depth, depth))
+            .and_then(|t| t.planes.first()).map(|p| p.texture.clone())
     }
 
-    /// The copies between depth textures and their twins that a pass needs before it runs, as
-    /// (twin, its depth texture, whether into the depth texture); notes which side holds the
-    /// newer contents after the pass ([`DepthTwin::twin_newer`]). Before a compute pass
-    /// (`compute`), every twin whose depth texture is newer takes its contents. Before a pass
-    /// that draws into, clears or copies to or from one of the textures `depths` names, a newer
-    /// twin goes into it first (not when the pass writes it whole: a depth clear), and the
-    /// depth texture is the newer side from then on. Guess: a render pass that only reads a twin
-    /// (a shadow map sampled through a colour view) follows a compute pass, not the draws into
-    /// its depth texture alone; else it reads the twin's older contents.
-    #[allow(clippy::type_complexity)]
-    fn twin_copies(&self, compute: bool, depths: &[(&Rc<B::Texture>, bool)]) -> Vec<(Rc<DepthTwin<B>>, Rc<B::Texture>, bool)> {
-        let mut out = Vec::new();
-        let mut twins = self.twins.borrow_mut();
-        if twins.is_empty() {
-            return out;
-        }
-        twins.retain(|_, t| t.depth.strong_count() > 0);
-        if compute {
-            for t in twins.values() {
-                if !t.twin_newer.get()
-                    && let Some(d) = t.depth.upgrade()
-                {
-                    t.twin_newer.set(true);
-                    out.push((t.clone(), d, false));
-                }
-            }
-        }
-        for &(d, whole) in depths {
-            if let Some(t) = twins.get(&(Rc::as_ptr(d) as usize))
-                && t.depth.upgrade().is_some_and(|x| Rc::ptr_eq(&x, d))
-            {
-                if t.twin_newer.get() && !whole {
-                    out.push((t.clone(), d.clone(), true));
-                }
-                t.twin_newer.set(false);
-            }
-        }
-        out
+    #[cfg(all(test, target_os = "macos"))]
+    fn twin_test_use(&self, compute: bool, depth: &Rc<B::Texture>) -> Option<(Rc<Twin<B>>, bool)> {
+        let twin = self.twins.borrow().values().flatten().find(|t| Rc::ptr_eq(&t.depth, depth)).cloned()?;
+        let side = if compute { twin::TWIN } else { twin::DEPTH };
+        let copy = twin.need(side);
+        twin.newer.set(side);
+        copy.map(|to_depth| (twin, to_depth))
     }
 
-    /// The depth textures the commands `cmds` draw into, clear, or copy to or from, for
-    /// [`Self::twin_copies`]: with whether the command writes the depth plane whole.
-    fn twin_uses<'a>(&self, cmds: &[&'a Cmd<B>]) -> Vec<(&'a Rc<B::Texture>, bool)> {
-        if self.twins.borrow().is_empty() {
-            return vec![];
-        }
-        let mut uses = vec![];
-        for &c in cmds {
-            match c {
-                Cmd::Draw { targets: Targets { depth: Some(d), .. }, .. } => uses.push((d, false)),
-                Cmd::Clear { depth: Some((d, z, _)), .. } => uses.push((d, z.is_some())),
-                Cmd::CopyTexture { src, dst, .. } => uses.extend([(src, false), (dst, false)]),
-                Cmd::CopyTextureToBuffer { src, .. } => uses.push((src, false)),
-                Cmd::CopyBufferToTexture { dst, .. } => uses.push((dst, false)),
-                _ => {}
-            }
-        }
-        uses
-    }
-
-    /// [`Self::twin_copies`] for one depth texture, before a compute pass (`compute`) or a render
-    /// pass into it: whether each copy it would make goes into the depth texture (`true`) or
-    /// into the twin.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn twin_copies_for_test(&self, compute: bool, depth: &Rc<B::Texture>) -> Vec<bool> {
-        let depths: &[(&Rc<B::Texture>, bool)] = if compute { &[] } else { &[(depth, false)] };
-        self.twin_copies(compute, depths).into_iter().filter(|c| Rc::ptr_eq(&c.1, depth)).map(|c| c.2).collect()
+        self.twin_test_use(compute, depth).into_iter().map(|(_, to_depth)| to_depth).collect()
     }
 
-    /// The blits that make `copies` ([`Self::twin_copies`]): each through the twin's buffer, since
-    /// Metal copies a depth plane only to and from buffers (`DepthFromDepthStencil`).
-    #[allow(clippy::type_complexity)]
-    fn twin_blits<'a>(copies: &'a [(Rc<DepthTwin<B>>, Rc<B::Texture>, bool)]) -> Vec<BlitOp<'a, B>> {
-        let mut ops = Vec::new();
-        for (twin, depth, to_depth) in copies {
-            let (w, h, b) = (twin.width, twin.height, twin.texel);
-            let stage = (&*twin.stage.buf, twin.stage.ptr().cast_const());
-            let (src, dst): (&B::Texture, &B::Texture) = if *to_depth { (&twin.texture, depth) } else { (depth, &twin.texture) };
-            ops.push(BlitOp::CopyTextureToBuffer {
-                src,
-                src_mip: 0,
-                src_slice: 0,
-                src_origin: [0; 3],
-                size: [w, h, 1],
-                dst: stage,
-                len: w * h * b,
-                row_pitch: w * b,
-                slice_pitch: w * h * b,
-            });
-            ops.push(BlitOp::CopyBufferToTexture {
-                src: stage,
-                len: w * h * b,
-                row_pitch: w * b,
-                slice_pitch: w * h * b,
-                size: [w, h, 1],
-                dst,
-                dst_mip: 0,
-                dst_slice: 0,
-                dst_origin: [0; 3],
-            });
-        }
-        ops
-    }
-
-    /// The copies [`Self::twin_copies`] gives, run on the GPU now and waited for.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn run_twin_copies_for_test(&self, compute: bool, depth: &Rc<B::Texture>) -> usize {
-        let depths: &[(&Rc<B::Texture>, bool)] = if compute { &[] } else { &[(depth, false)] };
-        let copies: Vec<_> = self.twin_copies(compute, depths).into_iter().filter(|c| Rc::ptr_eq(&c.1, depth)).collect();
+        let Some((twin, to_depth)) = self.twin_test_use(compute, depth) else { return 0 };
         let q = self.backend.create_queue().unwrap();
         let f = self.backend.create_fence(0).unwrap();
-        let passes = [Pass::Blit(Self::twin_blits(&copies))];
+        let passes = [Pass::Blit(twin.copy(to_depth))];
         self.backend.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &[(&f, 1)] }).unwrap();
         assert!(self.backend.wait(&f, 1, 10_000), "GPU did not finish");
-        copies.len()
+        1
     }
 
     /// Names a buffer resource object `key` (what `CreateShaderResourceView` is passed) at title memory.
@@ -775,7 +1411,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.resources
             .borrow_mut()
             .insert(key, Res::Buffer(addr, len));
-        self.resources_epoch.set(self.resources_epoch.get() + 1);
+        self.resources_changed(key);
     }
 
     /// Besides [`Self::register_buffer`]: the buffer's memory is the host's own, not a pool's, and
@@ -789,11 +1425,80 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// so views of it map the title's levels onto the host's.
     pub fn set_dropped_levels(&self, key: usize, dropped: usize, host_mips: usize) {
         let mut map = self.dropped.borrow_mut();
+        let next = (dropped != 0).then_some((dropped, host_mips));
+        if map.get(&key).copied() == next { return; }
         if dropped == 0 {
             map.remove(&key);
         } else {
             map.insert(key, (dropped, host_mips));
         }
+        drop(map);
+        self.resources_changed(key);
+    }
+
+    /// Top title levels left off `key`'s host texture (0: it has them all).
+    pub fn dropped_count(&self, key: usize) -> usize {
+        self.dropped.borrow().get(&key).map_or(0, |&(d, _)| d)
+    }
+
+    /// Writes again every heap entry that shows texture `key`, and every entry cleared when the
+    /// texture last at that key was given up, from the record the title has there now. Entries
+    /// are otherwise written only when the title writes their record or a bound table spans
+    /// them, while shaders also take views from the heap at indices they compute: without this
+    /// such an entry goes on showing the host texture `key` had before it was registered again
+    /// (or nothing, once cleared) for as long as the title leaves the record alone. Returns how
+    /// many entries were written.
+    pub(crate) fn remirror_shown(&self, key: usize) -> usize {
+        let mut handles = Vec::new();
+        for heap in self.heaps.borrow().iter() {
+            let step = Self::step(heap.kind);
+            let mut indices = heap.entries_of(key);
+            indices.extend(heap.take_gone(key));
+            indices.sort_unstable();
+            indices.dedup();
+            for index in indices {
+                // A cleared entry's stamp may be the one a covered key was given.
+                heap.mirrored.borrow_mut().remove(&index);
+                heap.pending_mirror.borrow_mut().remove(&index);
+                handles.push(heap.start + index as u64 * step);
+            }
+        }
+        handles.iter().filter(|&&h| self.mirror(h).is_ok_and(|done| done)).count()
+    }
+
+    /// The texture the title's record in entry `index` of `heap` names for sampling: its key,
+    /// and for a texture the title placed itself the address and description. `None` for any
+    /// other record (a buffer, an unordered access view, nothing).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn entry_texture(&self, heap: &NativeHeap<B>, index: usize) -> Option<(usize, Option<(u64, [u32; 14])>)> {
+        use crate::descriptor::View;
+        if index >= heap.count {
+            return None;
+        }
+        let handle = heap.start + index as u64 * Self::step(heap.kind);
+        let record = if self.records_readable(heap) {
+            // SAFETY: the heap's whole range is readable, and `index` is inside it.
+            unsafe { record_loaded(handle) }
+        } else {
+            record_at(handle)
+        };
+        match crate::descriptor::view_record(record)? {
+            View::Shader(r, _) => texture_info_of(r).map(|_| (r, None)),
+            View::Placed(false, res, d) if res[0] > 1 => {
+                let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                Some((super::textures::placed_key(address, &res), Some((address, res))))
+            }
+            _ => None,
+        }
+    }
+
+    /// Writes entry `index` of `heap` again from the title's record there, whatever was mirrored
+    /// before (`bake.rs`: a texture made again for it). Whether it now shows something.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn mirror_index(&self, heap: &NativeHeap<B>, index: usize) -> bool {
+        heap.mirrored.borrow_mut().remove(&index);
+        heap.pending_mirror.borrow_mut().remove(&index);
+        self.mirror(heap.start + index as u64 * Self::step(heap.kind)).is_ok_and(|done| done)
     }
 
     pub fn register_texture(&self, key: usize, texture: &Rc<B::Texture>) {
@@ -801,7 +1506,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.resources
             .borrow_mut()
             .insert(key, Res::Texture(texture.clone()));
-        self.resources_epoch.set(self.resources_epoch.get() + 1);
+        self.resources_changed(key);
+        // A new texture at this key: the old one's twin goes ([`Self::register_depth`] follows
+        // for a depth texture).
+        self.depths.borrow_mut().remove(&key);
+        self.twins.borrow_mut().remove(&key);
+        self.clearable.borrow_mut().remove(&key);
         // The entries cleared when the texture last at this address was released are checked
         // again: the record the title writes for the new one may equal the old one's.
         for heap in self.heaps.borrow().iter() {
@@ -842,12 +1552,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
             table: Default::default(),
             strides: Default::default(),
             addresses: Default::default(),
-            mirrored: Default::default(),
-            pending_mirror: Default::default(),
-            title_views: Default::default(),
-            images: Default::default(),
+            mirrored: RefCell::new(super::entries::Entries::new(count, self.dense_entries)),
+            pending_mirror: RefCell::new(super::entries::Entries::new(count, self.dense_entries)),
+            title_views: RefCell::new(super::entries::Entries::new(count, self.dense_entries)),
+            images: RefCell::new(super::list::Shown::new(count, self.dense_entries)),
+            spanned: RefCell::new(super::entries::Entries::new(count, self.dense_entries)),
+            unmapped: Default::default(),
+            twin_uavs: RefCell::new(super::entries::Entries::new(count, self.dense_entries)),
+            twin_srvs: RefCell::new(super::entries::Entries::new(count, self.dense_entries)),
+            depth_srvs: RefCell::new(super::entries::Entries::new(count, self.dense_entries)),
             used: Default::default(),
             typed_pending: Default::default(),
+            records: Cell::new(super::list::Records::Title(None)),
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -915,39 +1631,131 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The title released the heap whose descriptors start at `start`.
     pub fn drop_heap(&self, start: u64) {
-        self.heaps.borrow_mut().retain(|h| h.start != start);
+        self.clean_tables.invalidate(start, 0, usize::MAX);
+        // Lists recorded earlier may still bind it: its memory is the title's to free now.
+        self.heaps.borrow_mut().retain(|h| {
+            if h.start == start { h.records.set(super::list::Records::Released); }
+            h.start != start
+        });
     }
 
     /// The title released resource object `key`: later views naming it decode to nothing.
     pub fn forget_resource(&self, key: usize) {
+        self.forget_cached_resource(key);
         self.forget_marks(key);
-        if self.resources.borrow_mut().remove(&key).is_some() {
-            self.resources_epoch.set(self.resources_epoch.get() + 1);
+        self.resources.borrow_mut().remove(&key);
+        self.resources_changed(key);
+        self.depths.borrow_mut().remove(&key);
+        self.twins.borrow_mut().remove(&key);
+        self.clearable.borrow_mut().remove(&key);
+    }
+
+    fn resources_changed(&self, key: usize) {
+        let epoch = self.resources_epoch.get().checked_add(1).expect("resource version overflow");
+        self.resources_epoch.set(epoch);
+        let mut versions = self.resource_versions.borrow_mut();
+        if self.resources.borrow().contains_key(&key) {
+            versions.insert(key, epoch);
+        } else {
+            versions.remove(&key);
         }
     }
 
+    fn resource_version(&self, key: usize) -> u64 {
+        self.resource_versions.borrow().get(&key).copied().unwrap_or(0)
+    }
+
+    /// Only decode dependencies when actually mirroring, never on an unchanged table scan.
+    fn stamp_of(&self, record: [u8; 12], memory: u64, epoch: u64, view: &crate::descriptor::View) -> MirrorStamp {
+        use crate::descriptor::View;
+        let key = match view {
+            View::Shader(r, _) | View::Unordered(r, 0, _) => Some(*r),
+            View::Placed(_, res, d) if res[0] > 1 => {
+                let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                Some(super::textures::placed_key(address, res))
+            }
+            // A UAV counter is a second resource: descriptor::forget of either invalidates
+            // the record. Address-only views and samplers have no single resource key.
+            _ => None,
+        };
+        MirrorStamp {
+            record,
+            memory,
+            fixed_null: false,
+            resources: key.map(|key| (key, self.resource_version(key))),
+            epoch: Cell::new(epoch),
+        }
+    }
+
+    /// Fast path shared by device writes and table checks. Keep the pool generation for every
+    /// kind except fixed null buffers, including placed images: glue resolves their backing
+    /// memory through the pool table.
+    fn mirror_current(&self, heap: &NativeHeap<B>, index: usize, record: [u8; 12], memory: u64, epoch: u64) -> bool {
+        let mirrored = heap.mirrored.borrow();
+        let Some(stamp) = mirrored.get(&index) else { return false };
+        if stamp.record != record {
+            return false;
+        }
+        self.stamp_current(stamp, memory, epoch)
+    }
+
+    fn stamp_current(&self, stamp: &MirrorStamp, memory: u64, epoch: u64) -> bool {
+        if stamp.fixed_null {
+            return true;
+        }
+        if stamp.memory != memory {
+            return false;
+        }
+        if stamp.epoch.get() == epoch {
+            return true;
+        }
+        if let Some((key, version)) = stamp.resources
+            && self.resource_version(key) == version
+        {
+            stamp.epoch.set(epoch);
+            #[cfg(target_os = "macos")]
+            if self.trace_mirrors { frame_time::count(Metric::StampRevalidated, 1); }
+            return true;
+        }
+        false
+    }
+
     /// The title released texture `key` for good (its object's last reference, or the pool it was
-    /// placed in): besides [`Self::forget_resource`], the heap entries that show it are cleared.
+    /// placed in). Clears retained heap views, but keeps
+    /// their old stamps until a record rewrite or registration names the replacement.
     /// Left as they were, they kept the host texture alive and resident until the title happened
     /// to write another view there, so the memory the GPU holds wired grew with play time.
     /// A cleared entry is written again when the title writes another record there, or makes a
     /// texture at this address again ([`Self::register_texture`]). Its old record is not: it may
     /// name the next object at this address, of a format the view cannot be made over.
     pub fn release_resource(&self, key: usize) {
+        self.release_resource_inner(key, false);
+    }
+
+    /// Eviction can revive an unchanged record; final release waits for a replacement.
+    fn release_resource_inner(&self, key: usize, remirror: bool) {
+        self.forget_cached_resource(key);
         self.forget_marks(key);
         let removed = self.resources.borrow_mut().remove(&key);
         if removed.is_some() {
-            self.resources_epoch.set(self.resources_epoch.get() + 1);
+            self.resources_changed(key);
         }
         if let Some(Res::Buffer(addr, _)) = removed {
             self.own.borrow_mut().remove(&(addr, key));
         }
         let texture = matches!(removed, Some(Res::Texture(_)));
+        self.depths.borrow_mut().remove(&key);
+        self.twins.borrow_mut().remove(&key);
+        self.clearable.borrow_mut().remove(&key);
         if !texture {
             return;
         }
         for heap in self.heaps.borrow().iter() {
             for index in heap.take_entries(key) {
+                if remirror {
+                    heap.mirrored.borrow_mut().remove(&index);
+                    heap.pending_mirror.borrow_mut().remove(&index);
+                }
                 heap.typed_pending.borrow_mut().set(index, false, false);
                 self.backend.clear_entry(&heap.heap, index);
                 self.cleared.set(self.cleared.get() + 1);
@@ -959,15 +1767,32 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// address starts afresh).
     fn forget_marks(&self, key: usize) {
         self.evicted.borrow_mut().remove(&key);
+        self.covered.borrow_mut().remove(&key);
         self.unordered.borrow_mut().remove(&key);
     }
 
     /// Gives up the host texture of `key` under the texture budget: as [`Self::release_resource`]
-    /// (no heap entry shows it, so none is cleared), but an entry that names it again asks for it
-    /// ([`Self::take_wanted`]).
+    /// but cleared entries lose their stamps too, so an unchanged record asks for the texture
+    /// again ([`Self::take_wanted`]). Backend clears retire their allocations through the heap's
+    /// existing residency reconciliation; they do not edit a residency set directly.
     pub(crate) fn evict_texture(&self, key: usize) {
-        self.release_resource(key);
+        self.release_resource_inner(key, true);
         self.evicted.borrow_mut().insert(key);
+    }
+
+    /// A later placement owns this copy's memory. Keep its records null, including copies of
+    /// them into other entries, until an explicit title placement authorizes another copy.
+    pub(crate) fn cover_texture(&self, key: usize) {
+        self.release_resource_inner(key, true);
+        self.covered.borrow_mut().insert(key);
+    }
+
+    pub(crate) fn is_covered(&self, key: usize) -> bool {
+        self.covered.borrow().contains(&key)
+    }
+
+    pub(crate) fn placed_again(&self, key: usize) {
+        self.covered.borrow_mut().remove(&key);
     }
 
     /// Whether `key` was given up under the texture budget and not made again since.
@@ -989,6 +1814,33 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// entry shows counts as used), or ever showed it for unordered access.
     pub(crate) fn texture_in_use(&self, key: usize) -> bool {
         self.unordered.borrow().contains(&key) || self.heaps.borrow().iter().any(|h| h.shows_texture(key))
+    }
+
+    /// For `VICTORY_TRACE_STALE`: how many heap entries show a texture, and of those the ones
+    /// written for another version of their key than the one registered now (the key was
+    /// forgotten, or its texture made again, and nothing wrote the entry since: it still shows
+    /// the old host texture), counted by key and the version their stamp names.
+    pub(crate) fn stale_entries(&self) -> (usize, HashMap<(usize, u64), u32>) {
+        let (mut shown, mut stale) = (0, HashMap::new());
+        for heap in self.heaps.borrow().iter() {
+            let mirrored = heap.mirrored.borrow();
+            for (index, key) in heap.shown_entries() {
+                shown += 1;
+                let version = match mirrored.get(&index).and_then(|s| s.resources) {
+                    Some((k, v)) if k == key => v,
+                    _ => continue,
+                };
+                if self.resource_version(key) != version {
+                    *stale.entry((key, version)).or_default() += 1;
+                }
+            }
+        }
+        (shown, stale)
+    }
+
+    /// The version of `key`'s registration (0: not registered), which entry stamps name.
+    pub(crate) fn version_of(&self, key: usize) -> u64 {
+        self.resource_version(key)
     }
 
     /// Heap entries cleared so far because the texture they showed was released.
@@ -1040,7 +1892,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.resources.borrow().contains_key(&key)
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     pub(super) fn texture_at(&self, key: usize) -> Option<Rc<B::Texture>> {
         match self.resources.borrow().get(&key) {
             Some(Res::Texture(t)) => Some(t.clone()),
@@ -1053,43 +1905,243 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     /// The title wrote a view at descriptor `handle` (the call `descriptor::mirror` makes on
-    /// D3D12): decode its record and write the backend's entry; returns whether an entry was
-    /// written. A buffer view of memory in no pool gets the null view (no bytes) and the error:
+    /// D3D12): decode its record and write the backend's entry, or reuse an already current
+    /// entry; returns whether either succeeded. A buffer view of memory in no pool gets the
+    /// null view (no bytes) and the error:
     /// left as it was, the entry would still show the buffer an earlier view named there, which
     /// the title may have given to something else since, and the shader would read and write it.
     /// The entry is not marked mirrored, so the real view is written once the memory is mapped.
     /// Undecodable records and image or sampler views the host cannot make still leave the entry
     /// as it was: a buffer in a texture or sampler entry is not something to hand the GPU.
     pub fn mirror(&self, handle: u64) -> Result<bool, String> {
-        let found = self.heaps.borrow().iter().find_map(|h| {
-            let at = handle.checked_sub(h.start)?;
-            let index = (at / Self::step(h.kind)) as usize;
-            (index < h.count).then(|| (h.clone(), index))
-        });
-        let Some((heap, index)) = found else {
-            return Ok(false);
+        #[cfg(target_os = "macos")]
+        let _mirror = self.trace_mirrors.then(|| Timer::counted(Metric::Mirror, Metric::Mirrors));
+        let Some((heap, index)) = self.heap_at(handle) else { return Ok(false) };
+        self.clean_tables.invalidate(heap.start, index, index + 1);
+        // Capture before resolving; a concurrent mapping change cannot certify old memory.
+        let record = if self.records_readable(&heap) {
+            // SAFETY: the heap's whole range is readable, and `index` is inside it.
+            unsafe { record_loaded(handle) }
+        } else {
+            #[cfg(target_os = "macos")]
+            let _read = self.trace_mirrors.then(|| Timer::counted(Metric::SafeRead, Metric::SafeReads));
+            record_at(handle)
         };
-        let view = crate::descriptor::view(handle);
-        if heap.kind == HeapKind::Resource
-            && let Some(strides) = &*heap.strides.borrow()
-        {
-            self.write_strides(strides, index, view.as_ref());
+        let memory = self.memory.generation();
+        let epoch = self.resources_epoch.get();
+        if self.mirror_current(&heap, index, record, memory, epoch) {
+            #[cfg(target_os = "macos")]
+            if self.trace_mirrors { frame_time::count(Metric::MirrorSame, 1); }
+            return Ok(true);
         }
+        if self.quick_mirrors(&heap) {
+            let quick = {
+                let resources = self.resources.borrow();
+                // The view table's lock is held for the decode alone, never across a write.
+                let views = crate::descriptor::view_records();
+                Self::classify(views.get(record), &resources)
+            };
+            if let Some(done) = self.mirror_quick(&heap, index, record, quick, memory, epoch) {
+                return done;
+            }
+        }
+        self.mirror_record(&heap, index, record, memory, epoch)
+    }
+
+    /// What the host noted of entry `index` beyond its backend entry, which a new record there
+    /// replaces: the first step of every mirror, quick or general.
+    fn forget_entry(heap: &NativeHeap<B>, index: usize) {
+        heap.mirrored.borrow_mut().remove(&index);
+        Self::forget_views(heap, index);
+    }
+
+    /// [`Self::forget_entry`] without the stamp.
+    fn forget_views(heap: &NativeHeap<B>, index: usize) {
+        heap.spanned.borrow_mut().remove(&index);
+        {
+            let mut unmapped = heap.unmapped.borrow_mut();
+            if !unmapped.is_empty() { unmapped.remove(&index); }
+        }
+        heap.twin_uavs.borrow_mut().remove(&index);
+        heap.twin_srvs.borrow_mut().remove(&index);
+        heap.depth_srvs.borrow_mut().remove(&index);
+    }
+
+    /// Whether `heap`'s descriptor records can be read with plain loads now: memory the heap
+    /// object owns while the title holds the heap, or title memory the kernel reported readable
+    /// over the heap's whole range in this preparation scope (one query a heap and scope instead
+    /// of a kernel read a table). Otherwise records are read through the kernel, which cannot
+    /// fault.
+    fn records_readable(&self, heap: &NativeHeap<B>) -> bool {
+        use super::list::Records;
+        if !self.record_loads || !self.dense_entries { return false; }
+        let scope = self.prep_scope.get();
+        match heap.records.get() {
+            Records::Owned => true,
+            Records::Released => false,
+            Records::Title(Some((asked, readable))) if asked == scope => readable,
+            Records::Title(_) => {
+                let readable = super::readable(heap.start, heap.count as u64 * Self::step(heap.kind));
+                heap.records.set(Records::Title(Some((scope, readable))));
+                #[cfg(target_os = "macos")]
+                if self.trace_mirrors { frame_time::count(Metric::RegionQueries, 1); }
+                readable
+            }
+        }
+    }
+
+    /// Whether entries of `heap` may take [`Self::mirror_quick`].
+    fn quick_mirrors(&self, heap: &NativeHeap<B>) -> bool {
+        self.dense_entries && self.fast_buffers && heap.kind == HeapKind::Resource
+    }
+
+    /// What a record is, from its view (`Err`: none) and the registered resources, with the
+    /// address and stride words the heap's tables take where they follow from those alone
+    /// (as [`Self::address_words`] and [`Self::stride_word`] give them). It writes nothing,
+    /// takes no lock and reads no title object, so a table's records are classified together
+    /// under one lock of the view table.
+    fn classify(
+        view: Result<&crate::descriptor::View, crate::descriptor::RecordError>,
+        resources: &HashMap<usize, Res<Rc<B::Texture>>>,
+    ) -> Quick {
+        let view = match view {
+            Ok(view) => view,
+            Err(e) => return Quick::Nothing { kind: Nothing::of(e), words: Some(([0; 4], 0)) },
+        };
+        match decode(view, resources) {
+            // Its address words may be a texture's, read from the title's object: left to
+            // `mirror_quick`, outside the lock.
+            None => Quick::Nothing { kind: Nothing::undecoded(view, resources), words: None },
+            Some(Decoded::Buffer { addr, size }) if addr != 0 && typed_buffer(view, resources).is_none() => {
+                let words = Some(([addr as u32, (addr >> 32) as u32 & 0xFFFF, 0, 0], super::descriptors::stride_word(view, resources)));
+                use crate::descriptor::View;
+                // As `stamp_of`: a view of a buffer object follows that object's version.
+                let key = match view {
+                    View::Shader(r, _) | View::Unordered(r, 0, _) => Some(*r),
+                    _ => None,
+                };
+                Quick::Buffer { addr, size, key, constant: matches!(view, View::Constant(..)), words }
+            }
+            Some(_) => Quick::General,
+        }
+    }
+
+    /// [`Self::mirror_record`] for the two kinds a ring heap's fresh entries mostly are, with
+    /// nothing decoded twice, hashed or allocated: a plain buffer view that one pool mapping
+    /// holds, and a record that is no view. The same state as the general path leaves; `None`
+    /// when that path must run (a buffer no single mapping holds: spans, wraps, unmapped memory;
+    /// a record with a cached snapshot).
+    fn mirror_quick(&self, heap: &NativeHeap<B>, index: usize, record: [u8; 12], quick: Quick, memory: u64, epoch: u64) -> Option<Result<bool, String>> {
+        // The heap's address and stride tables, if made, as the general path writes them.
+        let tables = |words: Option<([u32; 4], u32)>| {
+            let (addresses, strides) = (heap.addresses.borrow(), heap.strides.borrow());
+            if addresses.is_none() && strides.is_none() { return; }
+            let (address, stride) = words.unwrap_or_else(|| {
+                let view = crate::descriptor::view_record(record);
+                (self.address_words(view.as_ref()), self.stride_word(view.as_ref()))
+            });
+            if let Some(pages) = &*addresses { pages.write_at(4 * index, &address); }
+            // No texture view takes this path: no minimum LOD clamp.
+            if let Some(pages) = &*strides { Self::write_stride_words(pages, index, stride, 0); }
+        };
+        match quick {
+            Quick::General => None,
+            Quick::Nothing { kind, words } => {
+                // A snapshot of the record replays in the general path (a view whose resource
+                // the title is still releasing).
+                if self.cache_mirrors && self.mirror_cache.borrow().contains_key(&record) { return None; }
+                Self::forget_entry(heap, index);
+                tables(words);
+                self.count_quick(record, Some(kind), false);
+                Some(Ok(false))
+            }
+            Quick::Buffer { addr, size, key, constant, words } => {
+                self.forget_released();
+                let (buf, ptr, sig) = self.resolve_pool_followed(addr, u64::from(size)).ok().flatten()?;
+                // The stamp is replaced below: nothing between here and there can fail.
+                Self::forget_views(heap, index);
+                tables(words);
+                // Followed as the general path follows a view one pool run holds.
+                match sig {
+                    Some(sig) => drop(heap.title_views.borrow_mut().insert(index, (addr, u64::from(size), Some(sig)))),
+                    None => drop(heap.title_views.borrow_mut().remove(&index)),
+                }
+                self.backend.write_buffer(&heap.heap, index, &buf, ptr, size);
+                heap.typed_pending.borrow_mut().set(index, false, false);
+                heap.shows(index, None);
+                heap.mark_mirrored(index, MirrorStamp {
+                    record,
+                    memory,
+                    fixed_null: false,
+                    resources: key.map(|key| (key, self.resource_version(key))),
+                    epoch: Cell::new(epoch),
+                });
+                self.count_quick(record, None, constant);
+                Some(Ok(true))
+            }
+        }
+    }
+
+    /// The decode-cache miss counters of one quick mirror, as the general path counts them.
+    fn count_quick(&self, record: [u8; 12], nothing: Option<Nothing>, constant: bool) {
+        #[cfg(test)]
+        self.quick_mirrored.set(self.quick_mirrored.get() + 1);
+        #[cfg(target_os = "macos")]
+        if self.trace_mirrors {
+            use mirror_cache::Miss;
+            let reason = if !self.cache_mirrors { Miss::Disabled } else {
+                match self.mirror_misses.borrow().get(&record) {
+                    None | Some(Miss::Cold) => Miss::Uncacheable,
+                    Some(reason) => *reason,
+                }
+            };
+            frame_time::count(reason.metric(), 1);
+            frame_time::count(match nothing {
+                Some(nothing) => nothing.metric(),
+                None if constant => Metric::MissConstant,
+                None => Metric::MissBuffer,
+            }, 1);
+            frame_time::count(Metric::MirrorQuick, 1);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (record, nothing, constant);
+    }
+
+    /// Both callers have already checked the slot's stamp; table scans also supply its bytes.
+    fn mirror_record(&self, heap: &NativeHeap<B>, index: usize, record: [u8; 12], memory: u64, epoch: u64) -> Result<bool, String> {
+        Self::forget_entry(heap, index);
+        let miss = match self.cached_mirror(heap, index, record, memory, epoch) {
+            Ok(()) => return Ok(true), Err(reason) => reason,
+        };
+        let (view, nothing) = match crate::descriptor::view_records().get(record) {
+            Ok(view) => (Some(view.clone()), Nothing::Unknown),
+            Err(e) => (None, Nothing::of(e)),
+        };
         if heap.kind == HeapKind::Resource
             && let Some(addresses) = &*heap.addresses.borrow()
         {
             addresses.write_at(4 * index, &self.address_words(view.as_ref()));
         }
+        if heap.kind == HeapKind::Resource
+            && let Some(strides) = &*heap.strides.borrow()
+        {
+            self.write_strides(strides, index, view.as_ref());
+        }
         let Some(view) = view else {
-            // Emptied (by the title's stores): not mirrored any more, so a submission does not
-            // look at it again until the title writes a record there.
-            heap.mirrored.borrow_mut().remove(&index);
+            let _miss = self.miss_counter(miss, None, None, nothing);
             return Ok(false);
         };
+        let mut stamp = self.stamp_of(record, memory, epoch, &view);
         let resources = self.resources.borrow();
-        let Some(decoded) = decode(&view, &resources) else {
-            return Ok(false);
-        };
+        let decoded = decode(&view, &resources);
+        let nothing = Nothing::undecoded(&view, &resources);
+        // Plain buffer views are just a pool lookup and entry words. Only views that may
+        // need an expensive texture-buffer promotion retain decoded backend snapshots.
+        let mut cacheable = !self.fast_buffers
+            || !matches!(&decoded, Some(Decoded::Buffer { addr, .. }) if *addr != 0)
+            || typed_buffer(&view, &resources).is_some();
+        let miss = self.miss_counter(miss, decoded.as_ref(), Some(&view), nothing);
+        let Some(decoded) = decoded else { return Ok(false); };
         if !matches!(decoded, Decoded::Buffer { .. }) {
             heap.title_views.borrow_mut().remove(&index);
         }
@@ -1102,6 +2154,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             // no pool, it was tried again after every change to the pool table, which world
             // streaming makes all the time. Not a view whose title pages are followed either.
             Decoded::Buffer { addr: 0, .. } => {
+                stamp.fixed_null = matches!(view, crate::descriptor::View::Constant(..) | crate::descriptor::View::Placed(..));
                 heap.title_views.borrow_mut().remove(&index);
                 let null = self.null_view()?;
                 self.backend.write_buffer(&heap.heap, index, &null.buf, null.ptr().cast_const(), 0);
@@ -1110,30 +2163,41 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heap.shows(index, None);
             }
             Decoded::Buffer { addr, size } => {
-                // Read before resolving: a pool mapped by a title thread after a failed resolve
-                // must bump past these, so the entry is retried.
-                let (pool_gen, res_gen) = (self.memory.generation(), self.resources_epoch.get());
-                let alias = || self.title_alias(addr, u64::from(size)).map(|(b, p, sig)| (b, p, Some(sig)));
-                let found = self.resolve(addr, u64::from(size)).map(|(b, p)| (b, p, None));
+                // Resolve through pool pointers (including stitched spans) first, as on the
+                // pre-merge host: a title VA in the pool table need not be mapped in this
+                // process. Only a range the span contract cannot serve tries a direct wrap.
+                // Keep the wrap's own signature instead of walking again to infer its origin.
+                let alias = || self.title_alias(addr, u64::from(size)).map(|(b, p, sig)| (b, p, None, Some(sig)));
+                let found = self.resolve_view(addr, u64::from(size)).map(|(b, p, span)| (b, p, span, None));
                 let (buf, ptr) = match found.map_or_else(|e| alias().ok_or(e), Ok) {
-                    Ok((buf, ptr, wrapped)) => {
+                    Ok((buf, ptr, span, wrapped)) => {
+                        // Cross-mapping views benefit from caching their expensive validation.
+                        cacheable |= span.is_some() || wrapped.is_some();
+                        if let Some(span) = span {
+                            heap.spanned.borrow_mut().insert(index, span);
+                        }
                         // A view one pool run holds is followed as a wrap is: the title maps
                         // other pool pages under the same addresses (memory it frees and takes
-                        // again) and writes the same record, so nothing else mirrors it again.
-                        // Memory outside the pool table (the host's own) has no signature.
-                        let sig = wrapped.or_else(|| self.alias_signature(addr, u64::from(size)));
-                        let mut views = heap.title_views.borrow_mut();
-                        match sig {
-                            Some(sig) => {
-                                views.insert(index, (addr, u64::from(size), Some(sig)));
-                            }
-                            None => {
-                                views.remove(&index);
-                            }
+                        // again) and writes the same record, so nothing else mirrors it again
+                        // where no bound table shows it. Memory outside the pool table (the
+                        // host's own) has no signature; a span is followed by `refresh_spans`.
+                        let sig = wrapped.or_else(|| {
+                            (span.is_none() && self.follow_pool_views).then(|| self.alias_signature(addr, u64::from(size))).flatten()
+                        });
+                        if let Some(sig) = sig {
+                            heap.title_views.borrow_mut().insert(index, (addr, u64::from(size), Some(sig)));
+                        } else {
+                            heap.title_views.borrow_mut().remove(&index);
                         }
                         (buf, ptr)
                     }
                     Err(e) => {
+                        // Tried again when the title maps memory (a null record is not a view).
+                        let mut unmapped = heap.unmapped.borrow_mut();
+                        if addr != 0 && size != 0 && unmapped.len() < UNMAPPED_ENTRIES {
+                            unmapped.insert(index);
+                        }
+                        drop(unmapped);
                         // Tried again once the pages under it change: a gap the title maps
                         // later, say ([`Self::follow_title_pages`]).
                         if addr != 0 && size != 0 {
@@ -1154,9 +2218,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         heap.pending_mirror.borrow_mut().insert(
                             index,
                             (
-                                record_at(handle),
-                                pool_gen,
-                                res_gen,
+                                stamp.record,
+                                stamp.memory,
+                                stamp.epoch.get(),
                             ),
                         );
                         heap.shows(index, None);
@@ -1182,6 +2246,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 min_lod,
             } => {
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
+                    if self.is_covered(resource) {
+                        self.backend.clear_entry(&heap.heap, index);
+                        heap.shows(index, None);
+                        heap.typed_pending.borrow_mut().set(index, false, false);
+                        heap.pending_mirror.borrow_mut().remove(&index);
+                        heap.mirrored.borrow_mut().insert(index, stamp);
+                        return Ok(true);
+                    }
                     // An evicted texture: made again at the next submission, which writes this
                     // entry then (registering bumps the epoch its retry waits for). Until then the
                     // entry shows nothing rather than what it showed before.
@@ -1192,19 +2264,24 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     return Ok(false);
                 };
-                // A colour view of a depth texture that compute writes shows its twin. Twins are
-                // made at unordered views of texture objects only (a placed view's key is no
-                // object to read the description of); a placed view shows an existing one.
-                let unordered = matches!(view, crate::descriptor::View::Unordered(..));
-                let twin = format.and_then(|f| self.depth_twin(resource, tex, f, unordered));
-                let (tex, format) = match &twin {
-                    Some((t, f)) => (t, Some(*f)),
-                    None => (tex, format),
-                };
+                // A depth texture: an unordered access view shows a plane of its writable twin
+                // (in the plane's own format, whatever the view's), any other view the texture.
+                let plane = self.twin_plane(resource, tex, &view);
+                if plane.is_some() {
+                    let uses = if matches!(view, crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..)) { &heap.twin_uavs } else { &heap.twin_srvs };
+                    uses.borrow_mut().insert(index, resource);
+                } else if self.depths.borrow().contains_key(&resource) {
+                    heap.depth_srvs.borrow_mut().insert(index, resource);
+                }
                 if matches!(view, crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..)) {
                     self.unordered.borrow_mut().insert(resource);
                 }
                 match (mips, format) {
+                    _ if plane.is_some() => {
+                        let (texture, format) = plane.as_ref().expect("a plane");
+                        let v = self.backend.create_texture_view(texture, &ViewDesc { format: *format, mips: (0, 1), slices: (0, 1) })?;
+                        self.backend.write_texture(&heap.heap, index, &v, 0.0);
+                    }
                     (Some((first, count)), Some(format)) if count > 0 => {
                         let (dropped, host_mips) = self.dropped.borrow().get(&resource).copied().unwrap_or((0, 0));
                         let mips = super::textures::host_mip_range(first as usize, count as usize, dropped, host_mips);
@@ -1232,8 +2309,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heap.shows(index, None);
             }
         }
-        heap.pending_mirror.borrow_mut().remove(&index);
-        heap.mirrored.borrow_mut().insert(index, record_at(handle));
+        if cacheable { self.cache_mirror(heap, index, &Rc::new(stamp.clone()), &view); }
+        else if self.cache_mirrors && miss.reason.get() == mirror_cache::Miss::Cold {
+            miss.reason.set(mirror_cache::Miss::Uncacheable);
+        }
+        heap.mark_mirrored(index, stamp);
         Ok(true)
     }
 
@@ -1366,13 +2446,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
         !self.evicted.borrow().is_empty()
     }
 
-    /// Mirrors again the entries of each table `root` binds whose title record changed since
+    /// Mirrors again entries whose record, mapping or resource identity changed since
     /// they were last mirrored. The title copies records into its shader-visible heaps with plain
     /// stores (the content draws' constant buffers, from frame ~700), which no device call reports,
     /// so their host entries stayed empty and the shaders read zeros.
     fn remirror_tables(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
+        // Inclusive of mirror() calls; report separately so they are not added twice to mirror.
+        #[cfg(target_os = "macos")]
+        let _remirror = Timer::counted(Metric::Remirror, Metric::Remirrors);
         let pool_gen = self.memory.generation();
-        let res_gen = self.resources_epoch.get();
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
             let (mut checked, mut changed) = (0, 0);
@@ -1386,22 +2468,65 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 }
                 used[*at..end].fill(frame);
             }
-            for (index, record) in (*at..end).zip(Self::table_records(h, *at..end)) {
-                let handle = h.start + (index * step) as u64;
-                checked += 1;
-                let seen = h.mirrored.borrow().get(&index).copied();
-                // An empty record is mirrored only if a view was mirrored there before: the title
-                // zeroed it with stores, and its view-stride dword must go to 0.
-                if seen == Some(record)
-                    || (record == [0; 12] && seen.is_none())
-                    || h.pending_mirror.borrow().get(&index) == Some(&(record, pool_gen, res_gen))
-                {
-                    continue;
+            let table = (h.start, *at, end);
+            let dependencies = table_clean::Dependencies {
+                memory: pool_gen, resources: self.resources_epoch.get(), spans: self.spans_made.get(),
+            };
+            if self.clean_tables.contains(table, dependencies) {
+                #[cfg(target_os = "macos")]
+                if self.trace_mirrors {
+                    frame_time::count(Metric::TableClean, 1);
+                    frame_time::count(Metric::TableEntriesSkipped, end.saturating_sub(*at) as u64);
                 }
+                continue;
+            }
+            #[cfg(target_os = "macos")]
+            if self.trace_mirrors { frame_time::count(Metric::TableScan, 1); }
+            let mut complete = true;
+            // Plain loads where the heap's memory is known readable; otherwise the whole span in
+            // one read (a system call each), entry by entry only if part of it cannot be read.
+            let loads = self.records_readable(h);
+            let mut span = Vec::new();
+            let whole = loads || {
+                span.resize(end.saturating_sub(*at) * step, 0u8);
+                #[cfg(target_os = "macos")]
+                let _read = Timer::counted(Metric::SafeRead, Metric::SafeReads);
+                super::safe_read((h.start + (*at * step) as u64) as *const u8, &mut span)
+            };
+            #[cfg(target_os = "macos")]
+            if loads && self.trace_mirrors { frame_time::count(Metric::RecordLoads, 1); }
+            let record_of = |index: usize| -> [u8; 12] {
+                let handle = h.start + (index * step) as u64;
+                if loads {
+                    // SAFETY: `records_readable` covers the heap's whole range, which the span is in.
+                    unsafe { record_loaded(handle) }
+                } else if whole {
+                    span[(index - *at) * step..][..12].try_into().expect("12 bytes")
+                } else {
+                    #[cfg(target_os = "macos")]
+                    let _read = Timer::counted(Metric::SafeRead, Metric::SafeReads);
+                    record_at(handle)
+                }
+            };
+            // One entry that needs it, mirrored: the quick path if it was classified for it.
+            let mut mirror_entry = |index: usize, record: [u8; 12], kind: Quick, res_gen: u64| {
+                let handle = h.start + (index * step) as u64;
                 changed += 1;
+                let quick_done = self.mirror_quick(h, index, record, kind, pool_gen, res_gen);
+                #[cfg(target_os = "macos")]
+                if quick_done.is_some() && self.trace_mirrors { frame_time::count(Metric::Mirrors, 1); }
                 // shortcut: views of resources the host has not realized yet are not made here
                 // (`glue::mirror` does that for device writes); such an entry stays as it was.
-                match self.mirror(handle) {
+                let result = if let Some(done) = quick_done {
+                    done
+                } else if self.cache_mirrors {
+                    #[cfg(target_os = "macos")]
+                    let _mirror = self.trace_mirrors.then(|| Timer::counted(Metric::Mirror, Metric::Mirrors));
+                    self.mirror_record(h, index, record, pool_gen, res_gen)
+                } else {
+                    self.mirror(handle)
+                };
+                match result {
                     Ok(true) => {}
                     Ok(false) => {
                         h.pending_mirror
@@ -1409,10 +2534,73 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             .insert(index, (record, pool_gen, res_gen));
                     }
                     Err(e) => {
+                        complete = false;
                         tracing::debug!(error = %e, handle = format!("{handle:#x}"), "a table entry was not mirrored at submission");
                     }
                 }
+                // Only mirror() records success. In particular a null view
+                // after an unmapped-buffer failure must be retried once mapped.
+            };
+            // Every record of the table checked and, if changed, classified in one pass: the
+            // stamps, the pending retries and the resources borrowed once, and one lock of the
+            // view table, released before anything is written. Only the changed entries are
+            // kept, each with the bytes read: the bytes classified are the bytes mirrored and
+            // stamped. What the pass decided holds while the resource epoch is the one it was
+            // decided under (a UAV mirrored here can create a twin and invalidate later SRVs of
+            // the table): from the first entry after a change, the exact loop below takes over.
+            let mut exact_from = *at;
+            if whole && self.quick_mirrors(h) {
+                let mut quick = self.quick.take();
+                quick.clear();
+                let classified = self.resources_epoch.get();
+                {
+                    let mirrored = h.mirrored.borrow();
+                    let pending = h.pending_mirror.borrow();
+                    let resources = self.resources.borrow();
+                    let mut views = None;
+                    let mut stamps = mirrored.cursor();
+                    for index in *at..end {
+                        let record = record_of(index);
+                        let current = match stamps.get(index) {
+                            Some(stamp) => same_record(&stamp.record, &record) && self.stamp_current(stamp, pool_gen, classified),
+                            None => same_record(&record, &[0; 12]),
+                        };
+                        if current || pending.get(&index) == Some(&(record, pool_gen, classified)) {
+                            continue;
+                        }
+                        let views = views.get_or_insert_with(crate::descriptor::view_records);
+                        quick.push((index, record, Self::classify(views.get(record), &resources)));
+                    }
+                }
+                exact_from = end;
+                for &(index, record, kind) in &quick {
+                    mirror_entry(index, record, kind, classified);
+                    if self.resources_epoch.get() != classified {
+                        exact_from = index + 1;
+                        break;
+                    }
+                }
+                checked += (exact_from - *at) as u64;
+                self.quick.replace(quick);
             }
+            for index in exact_from..end {
+                let record = record_of(index);
+                checked += 1;
+                // A preceding UAV can create a twin and invalidate later SRVs in this table.
+                let res_gen = self.resources_epoch.get();
+                if (record == [0; 12] && !h.mirrored.borrow().contains_key(&index))
+                    || self.mirror_current(h, index, record, pool_gen, res_gen)
+                    || h.pending_mirror.borrow().get(&index) == Some(&(record, pool_gen, res_gen))
+                {
+                    continue;
+                }
+                mirror_entry(index, record, Quick::General, res_gen);
+            }
+            // A UAV can create a twin during this scan; never certify earlier entries against
+            // an epoch they were not checked against. Mapping changes likewise force a retry.
+            if complete && whole && dependencies == (table_clean::Dependencies {
+                memory: self.memory.generation(), resources: self.resources_epoch.get(), spans: self.spans_made.get(),
+            }) { self.clean_tables.mark(table, dependencies); }
             super::descriptor_trace::record(h.start, checked, changed);
         }
     }
@@ -1432,9 +2620,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
         if !any_typed {
             return;
         }
+        let memory = self.memory.generation();
         let promote = |h: &NativeHeap<B>, index: usize| {
             let handle = h.start + index as u64 * Self::step(h.kind);
-            let Some(view) = crate::descriptor::view(handle) else { return };
+            // Same descriptor-write exclusion as descriptor::view: the title supplied this
+            // live slot, and must not rewrite it while its command is being prepared.
+            // SAFETY: this is the live heap slot the old promotion path read via view(handle).
+            let record = unsafe { (handle as *const [u8; 12]).read_unaligned() };
+            if self.cached_typed(h, index, record, memory, self.resources_epoch.get()) { return; }
+            let Some(view) = crate::descriptor::view_record(record) else { return };
             let resources = self.resources.borrow();
             let (Some(Decoded::Buffer { addr, size }), Some((format, writable, _))) =
                 (decode(&view, &resources), typed_buffer(&view, &resources))
@@ -1446,8 +2640,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 .resolve(addr, u64::from(size))
                 .ok()
                 .or_else(|| self.title_alias(addr, u64::from(size)).map(|(b, p, _)| (b, p)));
-            if let Some((buf, ptr)) = resolved
-                && self.backend.write_typed_buffer(
+            if let Some((buf, ptr)) = resolved {
+                let typed = self.backend.write_typed_buffer(
                     &h.heap,
                     index,
                     &buf,
@@ -1455,9 +2649,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     size,
                     format,
                     writable,
-                )
-            {
-                self.typed_views.set(self.typed_views.get() + 1);
+                );
+                self.typed_views.set(self.typed_views.get() + u64::from(typed));
+                self.cache_typed(h, index, record, typed);
             }
         };
         let mut indices = Vec::new();
@@ -1590,11 +2784,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// Writes entry `index`'s dwords of the view-stride table: its stride, and past the first
     /// `HEAP_VIEWS` its minimum LOD clamp ([`super::descriptors::min_lod_word`]).
     fn write_strides(&self, pages: &Pages<B>, index: usize, view: Option<&crate::descriptor::View>) {
+        let lod = view.map_or(0, |v| super::descriptors::min_lod_word(v, &self.resources.borrow()));
+        Self::write_stride_words(pages, index, self.stride_word(view), lod);
+    }
+
+    /// [`Self::write_strides`] with the two dwords given.
+    pub(super) fn write_stride_words(pages: &Pages<B>, index: usize, stride: u32, lod: u32) {
         // Shaders read no index past `HEAP_VIEWS`; the clamps follow there.
         let views = victory_shader::emit::HEAP_VIEWS as usize;
         if index < views {
-            pages.write_at(index, &[self.stride_word(view)]);
-            let lod = view.map_or(0, |v| super::descriptors::min_lod_word(v, &self.resources.borrow()));
+            pages.write_at(index, &[stride]);
             pages.write_at(views + index, &[lod]);
         }
     }
@@ -1756,11 +2955,22 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// (dword 0, and dword 1 bits 0-15), a texture view's size fields
     /// ([`crate::descriptor::texture_words`]), zeros for anything else.
     fn address_words(&self, view: Option<&crate::descriptor::View>) -> [u32; 4] {
+        use crate::descriptor::View;
         let Some(view) = view else { return [0; 4] };
-        if let Some(words) = crate::descriptor::texture_words(view) {
+        let resources = self.resources.borrow();
+        // Native keys can be opaque (including placed hashes), and records can outlive
+        // registrations. texture_words dereferences object views: only pass real Resources.
+        let texture = match view {
+            View::Shader(r, _) | View::Unordered(r, _, _) => {
+                !matches!(resources.get(r), Some(Res::Buffer(..)))
+                    && crate::resource::is_resource(*r as crate::object::This)
+            }
+            _ => true, // Placed views carry their own description, not an object pointer.
+        };
+        if texture && let Some(words) = crate::descriptor::texture_words(view) {
             return words;
         }
-        match decode(view, &self.resources.borrow()) {
+        match decode(view, &resources) {
             Some(Decoded::Buffer { addr, .. }) => [addr as u32, (addr >> 32) as u32 & 0xFFFF, 0, 0],
             _ => [0; 4],
         }
@@ -1803,12 +3013,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
             table: Default::default(),
             strides: Default::default(),
             addresses: Default::default(),
-            mirrored: Default::default(),
-            pending_mirror: Default::default(),
-            title_views: Default::default(),
-            images: Default::default(),
+            mirrored: RefCell::new(super::entries::Entries::new(0, self.dense_entries)),
+            pending_mirror: RefCell::new(super::entries::Entries::new(0, self.dense_entries)),
+            title_views: RefCell::new(super::entries::Entries::new(0, self.dense_entries)),
+            images: RefCell::new(super::list::Shown::new(0, self.dense_entries)),
+            spanned: RefCell::new(super::entries::Entries::new(0, self.dense_entries)),
+            unmapped: Default::default(),
+            twin_uavs: RefCell::new(super::entries::Entries::new(0, self.dense_entries)),
+            twin_srvs: RefCell::new(super::entries::Entries::new(0, self.dense_entries)),
+            depth_srvs: RefCell::new(super::entries::Entries::new(0, self.dense_entries)),
             used: Default::default(),
             typed_pending: Default::default(),
+            records: Cell::new(super::list::Records::Title(None)),
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)
@@ -1980,6 +3196,65 @@ impl<B: GraphicsBackend> NativeHost<B> {
             })
             .collect();
         out.dedup();
+        out
+    }
+
+    /// What `root` names, for `VICTORY_TRACE_FLOW`: its root views (`r<slot> <address>`) and, for
+    /// each resource table, the entries the shader takes (`entries`: `(slot, count)` from its
+    /// translation; 8 where that is not known): `<kind><slot>.<entry>` with kind `u` (unordered
+    /// access), `s` (shader resource) or `c` (constants), then a buffer's title address and size
+    /// or a texture's object, format and size.
+    #[cfg(target_os = "macos")]
+    pub(super) fn root_views(&self, root: &[Option<Root<B>>], entries: Option<&[(u8, usize)]>) -> Vec<String> {
+        let resources = self.resources.borrow();
+        let mut out = Vec::new();
+        for (slot, r) in root.iter().enumerate() {
+            match r {
+                Some(Root::View(a)) => out.push(format!("r{slot} {a:#x}")),
+                Some(Root::Constants(c)) => out.push(format!("k{slot} {:08x?}", &c[..c.len().min(16)])),
+                Some(Root::Table(h, at)) if h.kind == HeapKind::Resource => {
+                    let count = match entries {
+                        Some(e) => e.iter().filter(|e| usize::from(e.0) == slot).map(|e| e.1).max().unwrap_or(0),
+                        None => 8,
+                    };
+                    for k in 0..count {
+                        if at + k >= h.count {
+                            break;
+                        }
+                        let handle = h.start + (*at + k) as u64 * Self::step(HeapKind::Resource);
+                        let Some(view) = crate::descriptor::view(handle) else { continue };
+                        let kind = match &view {
+                            crate::descriptor::View::Constant(..) => 'c',
+                            crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..) => 'u',
+                            _ => 's',
+                        };
+                        match decode(&view, &resources) {
+                            Some(Decoded::Buffer { addr, size, .. }) => out.push(format!("{kind}{slot}.{k} {addr:#x}+{size:#x}")),
+                            Some(Decoded::Image { resource, mips, .. }) => {
+                                let mip = mips.map_or(0, |m| m.0);
+                                match &view {
+                                    // A texture the title placed itself: its key is no object.
+                                    crate::descriptor::View::Placed(_, res, d) => {
+                                        let base = u64::from(d[10]) | u64::from(d[11]) << 32;
+                                        let key = super::textures::placed_key(base, res);
+                                        out.push(format!("{kind}{slot}.{k} placed tex {key:#x} at {base:#x} fmt {} {}x{} mip {mip}", d[0], res[4], res[6]));
+                                    }
+                                    _ => {
+                                        let i = crate::resource::is_resource(resource as crate::object::This)
+                                            .then(|| texture_info_of(resource))
+                                            .flatten();
+                                        let (f, w, h2, a) = i.map_or((0, 0, 0, 0), |i| (i.format, i.width, i.height, i.memory as usize));
+                                        out.push(format!("{kind}{slot}.{k} tex {resource:#x} at {a:#x} fmt {f} {w}x{h2} mip {mip}"));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         out
     }
 
@@ -2285,6 +3560,107 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
+    /// For each of `cmds`, the twin copies to run before it (the twin, and whether into the depth
+    /// texture), in order; a command that has any starts a pass (`cut`). A command uses the
+    /// depth side of a texture as its depth target, as a copy's source or destination, or
+    /// through a shader resource view in a table it binds; the twin side through an unordered
+    /// access view in one. The side the commands leave newer is kept for the next submission.
+    fn twin_copies_before(&self, cmds: &[&Cmd<B>], cut: &mut [bool]) -> Vec<Vec<(Rc<Twin<B>>, bool)>> {
+        #[cfg(target_os = "macos")]
+        let _twin = Timer::new(Metric::Twin);
+        let twins = self.twins.borrow();
+        if !twins.values().any(Option::is_some) {
+            return Vec::new();
+        }
+        let of_texture = |t: &Rc<B::Texture>| twins.values().flatten().find(|w| Rc::ptr_eq(&w.depth, t)).cloned();
+        let mut pre: Vec<Vec<(Rc<Twin<B>>, bool)>> = vec![Vec::new(); cmds.len()];
+        for (k, c) in cmds.iter().enumerate() {
+            let mut out = Vec::new();
+            let mut need = |t: &Rc<Twin<B>>, side: u8, writes: bool| {
+                if let Some(to_depth) = t.need(side) {
+                    out.push((t.clone(), to_depth));
+                }
+                if writes {
+                    t.newer.set(side);
+                }
+            };
+            let (root, binding, target) = match c {
+                Cmd::Dispatch { root, pso, .. } => (Some(root), pso.binding.as_ref(), None),
+                Cmd::Draw { root, binding, targets, .. } => (Some(root), binding.as_deref(), targets.depth.as_ref()),
+                Cmd::Clear { color, depth, .. } => {
+                    // An unordered access clear of a depth texture clears a plane of its twin.
+                    if let Some((plane, _)) = color
+                        && let Some(t) = twins.values().flatten().find(|w| w.planes.iter().any(|p| Rc::ptr_eq(&p.texture, plane))).cloned()
+                    {
+                        need(&t, twin::TWIN, true);
+                    }
+                    (None, None, depth.as_ref().map(|d| &d.0))
+                }
+                Cmd::CopyTexture { src, dst, .. } => {
+                    if let Some(t) = of_texture(src) {
+                        need(&t, twin::DEPTH, false);
+                    }
+                    (None, None, Some(dst))
+                }
+                Cmd::CopyTextureToBuffer { src, .. } => {
+                    if let Some(t) = of_texture(src) {
+                        need(&t, twin::DEPTH, false);
+                    }
+                    (None, None, None)
+                }
+                Cmd::CopyBufferToTexture { dst, .. } => (None, None, Some(dst)),
+                Cmd::Copy { .. } | Cmd::Fill { .. } => (None, None, None),
+            };
+            // The depth target (or a copy's destination): the depth side, which the command may
+            // write (a draw's depth state is not looked at: at worst one copy more).
+            let target = target.and_then(of_texture);
+            if let Some(t) = &target {
+                need(t, twin::DEPTH, true);
+            }
+            for (slot, r) in root.into_iter().flatten().enumerate() {
+                let Some(Root::Table(h, at)) = r else { continue };
+                if h.kind != HeapKind::Resource {
+                    continue;
+                }
+                let end = (*at + table_check_count(slot, binding, Self::TABLE_CHECK)).min(h.count);
+                let of_key = |key: &usize| twins.get(key).and_then(Option::as_ref).filter(|t| !target.as_ref().is_some_and(|d| Rc::ptr_eq(d, t)));
+                h.depth_srvs.borrow().for_each_in(*at..end, |_, key| {
+                    if let Some(t) = of_key(key) {
+                        need(t, twin::DEPTH, false);
+                    }
+                });
+                h.twin_srvs.borrow().for_each_in(*at..end, |_, key| {
+                    if let Some(t) = of_key(key) {
+                        need(t, twin::TWIN, false);
+                    }
+                });
+                h.twin_uavs.borrow().for_each_in(*at..end, |_, key| {
+                    if let Some(t) = of_key(key) {
+                        need(t, twin::TWIN, true);
+                    }
+                });
+            }
+            if !out.is_empty() {
+                // `VICTORY_TRACE_TWIN=1`: each copy, and the kind of command it is for.
+                if env_set!("VICTORY_TRACE_TWIN") {
+                    let kind = match c {
+                        Cmd::Dispatch { .. } => "dispatch",
+                        Cmd::Draw { .. } => "draw",
+                        Cmd::Clear { .. } => "clear",
+                        _ => "copy",
+                    };
+                    for (t, to_depth) in &out {
+                        tracing::info!(submission = self.submissions.get(), command = k, kind, to_depth, size = ?t.size(), planes = t.planes.len(), "twin copy");
+                    }
+                }
+                self.twin_copies.set(self.twin_copies.get() + out.len() as u64);
+                cut[k] = true;
+                pre[k] = out;
+            }
+        }
+        pre
+    }
+
     /// The preparations of records 1 to n - 1 of `cmd` ([`Cmd::Draw::records`]), from `p`, the
     /// first's: each its own record, resolved as the first's, and count index.
     fn more_records(&self, cmd: &Cmd<B>, p: &Prep<B>) -> Vec<Result<Prep<B>, String>> {
@@ -2427,7 +3803,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 p.blit.push(self.resolve(*src, *len as u64)?);
                 p.blit.push(self.resolve(*dst, *len as u64)?);
             }
-            Cmd::Fill { dst, len, .. } => p.blit.push(self.resolve(*dst, *len as u64)?),
+            Cmd::Fill { dst, len, .. } => {
+                let r = self.resolve(*dst, *len as u64)?;
+                if self.backend.traces_fills() {
+                    self.backend.note_fill(r.1, self.describe_title(*dst, *len));
+                }
+                p.blit.push(r);
+            }
             Cmd::CopyBufferToTexture { src, len, .. } => {
                 p.blit.push(self.resolve(*src, *len as u64)?);
             }
@@ -2448,8 +3830,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
         waits: &[(&B::Fence, u64)],
         signals: &[(&B::Fence, u64)],
     ) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        let _execute = Timer::counted(Metric::Execute, Metric::Executes);
         let _counted = super::descriptor_trace::Submission;
+        self.submissions.set(self.submissions.get() + 1);
+        self.refresh_spans();
+        // Pools released since the last look are held from here (`forget_released`).
+        self.forget_released();
+        self.let_go_of_pools();
         self.follow_title_pages();
+        let _tables = self.clean_tables.begin(self.table_clean);
+        self.prep_scope.set(self.prep_scope.get() + 1);
         // A draw or dispatch that reads a root parameter the title never set is dropped by itself:
         // refusing the whole piece for it also dropped the piece's value writes, and a queue that
         // waits for one of those then holds everything behind it for good. (What the console
@@ -2483,6 +3874,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
         // the last kept one.
         let mut cut: Vec<bool> = Vec::new();
         let mut dropped: Vec<&Cmd<B>> = Vec::new();
+        #[cfg(target_os = "macos")]
+        let prep = Timer::new(Metric::Prep);
         // The pass trace (`glue::pass_note`): its lines in queue order. Only lists recorded while
         // its window was open hold notes.
         let noted = lists.iter().any(|l| !l.notes.is_empty());
@@ -2504,11 +3897,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
             .enumerate()
             .flat_map(|(li, l)| l.cmds.iter().enumerate().map(move |(ci, c)| (li, ci, c)))
         {
+            #[cfg(target_os = "macos")]
+            frame_time::count(Metric::Cmds, 1);
             // A draw or clear left with no target (the title's targets have formats the host does
             // not represent, so none was realized) cannot open a render pass: Metal gives no
-            // encoder for a pass without attachments, and that refused the whole piece.
+            // encoder for the pass its pipeline was made for, and that refused the whole piece.
+            // A draw of a pipeline the title made for no target is another matter: it writes
+            // through unordered access views (the lighting rasterizes its light volumes into the
+            // light masks so) and runs in a pass without attachments where the backend has them.
             let no_target = match c {
-                Cmd::Draw { targets, .. } => targets.color.is_empty() && targets.depth.is_none(),
+                Cmd::Draw { targets, pso, .. } => {
+                    targets.color.is_empty() && targets.depth.is_none() && !self.backend.render_pipeline_targetless(pso)
+                }
                 Cmd::Clear { color, depth, .. } => color.is_none() && depth.is_none(),
                 _ => false,
             };
@@ -2586,6 +3986,25 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         tracing::warn!(error = %e, "native host drops work: a command names title memory outside every mapped pool (first time; each at debug level)");
                     });
                     tracing::debug!(error = %e, "native host drops a command at unmapped title memory");
+                    if trace {
+                        let kind = match c {
+                            Cmd::Dispatch { .. } => "dispatch",
+                            Cmd::Draw { .. } => "draw",
+                            Cmd::Copy { .. } => "copy",
+                            Cmd::Fill { .. } => "fill",
+                            Cmd::CopyTexture { .. } => "texture copy",
+                            Cmd::CopyBufferToTexture { .. } => "buffer to texture",
+                            Cmd::CopyTextureToBuffer { .. } => "texture to buffer",
+                            Cmd::Clear { .. } => "clear",
+                        };
+                        let mut kinds = self.unmapped_kinds.borrow_mut();
+                        let key = format!("{kind}: {e}");
+                        if kinds.len() < 512 || kinds.contains_key(&key) {
+                            *kinds.entry(key).or_insert(0) += 1;
+                        } else {
+                            *kinds.entry("others".into()).or_insert(0) += 1;
+                        }
+                    }
                     lost_fill(c, &e);
                     dropped.push(c);
                 }
@@ -2604,6 +4023,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 }
             }
         }
+
+        #[cfg(target_os = "macos")]
+        drop(prep);
+
+        // Depth textures with a writable twin: before each command, the copies that bring the
+        // side it uses up to date (`super::twin`), in a pass of their own.
+        let pre = self.twin_copies_before(&cmds, &mut cut);
 
         let mut groups = vec![];
         let mut i = 0;
@@ -2678,22 +4104,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
             })
             .collect();
 
-        // Copies between depth textures and their twins, before the passes that need them
-        // ([`Self::twin_copies`]).
-        #[allow(clippy::type_complexity)]
-        let twin_copies: Vec<Vec<(Rc<DepthTwin<B>>, Rc<B::Texture>, bool)>> = groups
-            .iter()
-            .map(|g| match *g {
-                Group::Compute(..) => self.twin_copies(true, &[]),
-                // A render pass has one depth target, its first draw's.
-                Group::Render(a, _) | Group::Clear(a) => self.twin_copies(false, &self.twin_uses(&cmds[a..a + 1])),
-                Group::Blit(a, b) => self.twin_copies(false, &self.twin_uses(&cmds[a..b])),
-            })
-            .collect();
         let mut passes: Vec<Pass<'_, B>> = vec![];
         for (n, g) in groups.iter().enumerate() {
-            if !twin_copies[n].is_empty() {
-                passes.push(Pass::Blit(Self::twin_blits(&twin_copies[n])));
+            let first = match g {
+                Group::Compute(a, _) | Group::Blit(a, _) | Group::Render(a, _) | Group::Clear(a) => *a,
+            };
+            if let Some(copies) = pre.get(first).filter(|c| !c.is_empty()) {
+                passes.push(Pass::Blit(copies.iter().flat_map(|(t, to_depth)| t.copy(*to_depth)).collect()));
             }
             passes.push(match g {
                 Group::Compute(..) => Pass::Compute(&compute[n]),
@@ -2856,6 +4273,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                     state: *state,
                                     root: preps[k].root.clone(),
                                     fragment_root: preps[k].ps_root.clone(),
+                                    object_root: None,
                                     heaps: match &preps[k].heap {
                                         Some(m) => Heaps {
                                             resource: Some(&m.heap),
@@ -2881,6 +4299,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
             });
         }
         self.passes.set(self.passes.get() + passes.len() as u64);
+        #[cfg(target_os = "macos")]
+        let _backend = Timer::new(Metric::Backend);
         let submitted = self.backend.submit_passes(
             queue,
             &PassSubmission {
@@ -2927,10 +4347,25 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 }
 
+/// What an unordered access clear writes ([`NativeHost::unordered_clear_target`]).
+#[cfg(target_os = "macos")]
+pub(crate) enum ClearTarget<B: GraphicsBackend> {
+    Texture(Rc<B::Texture>),
+    /// Title address and length.
+    Buffer(u64, usize),
+}
+
+/// The host format of title texture `r`.
+#[cfg(target_os = "macos")]
+fn info_format(r: usize) -> Option<Format> {
+    texture_info_of(r)?.desc().map(|d| d.format)
+}
+
 /// The title texture a view names (macOS only; the target trace's).
 #[cfg(target_os = "macos")]
 fn texture_info_of(r: usize) -> Option<super::textures::TextureInfo> {
-    crate::resource::texture_info(r as crate::object::This)
+    // A key that is no live resource object (a placed texture's, a released one) is not read.
+    crate::resource::is_resource(r as crate::object::This).then(|| crate::resource::texture_info(r as crate::object::This)).flatten()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3041,8 +4476,7 @@ mod tests {
     #[test]
     fn the_mapping_list_is_read_again_only_when_the_pool_table_changes() {
         use super::super::memory::{PoolInfo, PoolObserver};
-        let Ok(metal) = victory_metal::metal::Metal::new() else { return };
-        let h = NativeHost::new(metal);
+        let h = NativeHost::new(super::super::vertex_tests::Capture::default());
         let pool = PoolInfo { id: 1, base: 0x1000_0000, len: 0x10_0000, memory_entry: None };
         h.memory().mapped(0x7000_0000, 0x1_0000, &pool, 0);
         let (g, a) = h.mapping_list();
@@ -3072,3 +4506,7 @@ mod tests {
         assert!(h.maps.borrow().is_none());
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "mirror_tests.rs"]
+pub(super) mod mirror_tests;

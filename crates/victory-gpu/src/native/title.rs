@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::resources::{Format, GraphicsBackend, PresentBackend};
+#[cfg(target_os = "macos")]
+use victory_metal::frame_time::{Metric, Timer};
 
 /// A wait for a memory value (`Wait32BitValueX`, `Wait64BitValueX`): the value at `address`
 /// (`bytes` 4 or 8, masked) compared with `reference` by a D3D12 comparison function.
@@ -116,7 +118,7 @@ impl<B: GraphicsBackend> TitleList<B> {
     /// The copies clone `Rc`s that the title's recording threads clone and drop under the title's
     /// lock, and `Rc` counts are not atomic: `_locked` is there so that only a holder of the title
     /// (inside `glue::with_title`) can take them.
-    pub fn segments<P: PresentBackend>(&self, _locked: &Title<P>) -> Vec<(NativeList<B>, Vec<Wait>)> {
+    pub fn segments<P: PresentBackend + super::host::DescriptorBackend>(&self, _locked: &Title<P>) -> Vec<(NativeList<B>, Vec<Wait>)> {
         self.done
             .iter()
             .map(|(l, w)| (l.snapshot(), w.clone()))
@@ -143,11 +145,18 @@ pub struct Stats {
     pub undetilable: u64,
 }
 
+/// Why a mesh dispatch could not be recorded. Retained in the pipeline cache so every
+/// attempted dispatch is counted, while shader diagnostics are emitted only once.
+#[derive(Clone, Copy, Debug)]
+pub enum MeshRefusal { OverLimit, ConversionFailed, NoPipeline }
+
 /// What a title pipeline object became on the host.
 pub enum Pipe<B: GraphicsBackend> {
     Compute(Rc<ComputePso<B>>),
     /// With the argument layout of its translated shaders (none: the title's root as it is).
+    /// A mesh pipeline is one too (its backend pipeline has a mesh thread-group size).
     Render(Rc<B::RenderPipeline>, Option<Rc<Binding>>),
+    MeshRefused(MeshRefusal),
     /// A guessed graphics pipeline (`VICTORY_GUESS_GRAPHICS`): made, per target formats and
     /// vertex strides, at its draws.
     Guess(Rc<Guessed<B>>),
@@ -163,6 +172,7 @@ impl<B: GraphicsBackend> Clone for Pipe<B> {
         match self {
             Pipe::Compute(p) => Pipe::Compute(p.clone()),
             Pipe::Render(p, b) => Pipe::Render(p.clone(), b.clone()),
+            Pipe::MeshRefused(r) => Pipe::MeshRefused(*r),
             Pipe::Guess(g) => Pipe::Guess(g.clone()),
             #[cfg(target_os = "macos")]
             Pipe::Skipped => Pipe::Skipped,
@@ -186,21 +196,28 @@ pub struct Guessed<B: GraphicsBackend> {
 }
 
 /// An operation that must keep its place between list submissions in the held FIFO.
-enum QueuedAction<B: PresentBackend> {
+enum QueuedAction<B: PresentBackend + super::host::DescriptorBackend> {
     Signal(Rc<B::Queue>, Rc<B::Fence>, u64),
     Present(Rc<B::Queue>, Rc<B::Surface>, Vec<Rc<B::Texture>>),
 }
 
-pub struct Title<B: PresentBackend> {
+type FlowSnap<T> = (u32, String, Rc<T>, u32, [usize; 3]);
+
+pub struct Title<B: PresentBackend + super::host::DescriptorBackend> {
     pub host: NativeHost<B>,
     /// Host pipelines by title pipeline object, made at first use.
     pub pipelines: HashMap<usize, Pipe<B>>,
+    /// Rectangle-output variants, separate from ordinary and guessed-strip pipelines.
+    pub rect_pipes: HashMap<(usize, TargetFormats), Pipe<B>>,
     /// Host pipelines of the console's pipelines (whose state names no target formats) by title
     /// pipeline object and the targets of the draw ([`super::console_state`]).
     pub console_pipes: HashMap<(usize, TargetFormats), Pipe<B>>,
     /// Host pipelines of compute pipelines dispatched with thread counts (`DispatchX`), whose
     /// shader is translated for that, by title pipeline object.
     pub thread_pipes: HashMap<usize, Pipe<B>>,
+    /// `VICTORY_TRACE_FLOW_SNAP`: copies of a colour target made on the GPU in the middle of a
+    /// captured frame (sequence number, what the copy follows, the copy, format, [width, height, depth]).
+    pub flow_snaps: Vec<FlowSnap<B::Texture>>,
     /// What the shader path did, and refused.
     pub shaders: super::shaders::ShaderStats,
     /// How long a new pipeline may hold the frame while Metal compiles it (`glue::compile_wait`);
@@ -240,13 +257,41 @@ pub struct Title<B: PresentBackend> {
     pub(super) copies_of: HashMap<usize, (usize, super::textures::TextureInfo)>,
     /// Keys in `textures` by the title memory they start at.
     pub(super) at_memory: HashMap<usize, Vec<usize>>,
-    /// Placed copies another placement covered, given up once nothing uses them
+    /// Keys whose host texture keeps every level whatever `VICTORY_TEXTURE_DROP_TOP_MIP` says: a
+    /// GPU copy named a level it would have been made without ([`Self::full_levels`]).
+    pub(super) full: std::collections::HashSet<usize>,
+    /// Textures a draw that takes views from the heap at indices in its constants named, with the
+    /// submission (`sync_serial`) it was recorded before (`textures/bake.rs`): kept meanwhile.
+    pub(super) heap_read: HashMap<usize, u64>,
+    /// Resource objects the GPU writes whose texture placed views over the same memory cannot
+    /// show (block-compressed views of plain texels of the block's size): the views' keys, and
+    /// the submission (`sync_serial`) through which the object's texture is copied into theirs
+    /// ([`Self::alias_copies`]).
+    pub(super) alias_copies: HashMap<usize, (Vec<usize>, u64)>,
+    /// Placed copies another placement covered, mapped to the displacing key; given up once safe
     /// ([`Self::give_up_covered`]).
-    pub(super) covered: std::collections::HashSet<usize>,
+    pub(super) covered: HashMap<usize, usize>,
     /// The covered copies [`Self::give_up_covered`] has still to check in its current sweep.
     pub(super) covered_queue: Vec<usize>,
-    /// Resource objects whose host texture a placed view names too: its address and key.
-    pub(super) shared: HashMap<usize, (u64, usize)>,
+    /// Give up covered copies by clearing the entries that show them, unless
+    /// `VICTORY_COVERED_CLEAR=0` (upstream's wait: a covered copy goes once no entry shows it).
+    /// Neither is right: clearing nulls textures the title samples, and the wait's extra copies
+    /// came with GPU hangs as the opening cutscene starts (docs/native-host.md, "The opening
+    /// cutscene's outfit"; "Interior lighting after the merge", cause 2).
+    pub(super) covered_clear: bool,
+    pub(super) covered_history: super::textures::CoveredHistory,
+    /// When `VICTORY_TRACE_MEMORY` last logged ([`Self::trace_memory`]).
+    pub(super) memory_logged: Option<std::time::Instant>,
+    /// `VICTORY_PLACED_AGAIN=1`: a description placed again over other bytes than its copy holds
+    /// is read again at once ([`Self::placed_again`]). Off by default: not shown to help in a
+    /// run, and it writes into host textures work in flight may use (docs/native-host.md, "The
+    /// opening cutscene's outfit").
+    pub(super) reread_placed: bool,
+    /// What `VICTORY_TRACE_STALE` remembers between its checks.
+    pub(super) stale: super::textures::StaleAudit,
+    /// Resource objects whose host texture placed views name too: each view's address, key and
+    /// description.
+    pub(super) shared: HashMap<usize, Vec<(u64, usize, super::textures::TextureInfo)>>,
     queues: HashMap<usize, Rc<B::Queue>>,
     fences: HashMap<usize, Rc<B::Fence>>,
     pub(super) held: Held<Rc<NativeList<B>>>,
@@ -260,15 +305,17 @@ pub struct Title<B: PresentBackend> {
     pub stats: Stats,
 }
 
-impl<B: PresentBackend> Title<B> {
+impl<B: PresentBackend + super::host::DescriptorBackend> Title<B> {
     pub fn new(backend: B, memory: Arc<PoolTable>) -> Self {
         let host = NativeHost::with_memory(backend, memory);
         host.collect_written(std::env::var("VICTORY_TEXTURE_BACK").as_deref() == Ok("1"));
         Title {
             host,
             pipelines: HashMap::new(),
+            rect_pipes: HashMap::new(),
             console_pipes: HashMap::new(),
             thread_pipes: HashMap::new(),
+            flow_snaps: Vec::new(),
             shaders: Default::default(),
             compile_wait: std::time::Duration::MAX,
             libraries: Default::default(),
@@ -289,8 +336,16 @@ impl<B: PresentBackend> Title<B> {
             placed_reach: 0,
             copies_of: HashMap::new(),
             at_memory: HashMap::new(),
+            full: Default::default(),
+            heap_read: HashMap::new(),
+            alias_copies: HashMap::new(),
             covered: Default::default(),
             covered_queue: Default::default(),
+            covered_clear: std::env::var("VICTORY_COVERED_CLEAR").as_deref() != Ok("0"),
+            covered_history: Default::default(),
+            memory_logged: None,
+            reread_placed: std::env::var("VICTORY_PLACED_AGAIN").as_deref() == Ok("1"),
+            stale: Default::default(),
             queues: HashMap::new(),
             fences: HashMap::new(),
             requested: HashMap::new(),
@@ -335,11 +390,16 @@ impl<B: PresentBackend> Title<B> {
     /// Every title fence with a backend fence and the value it has completed: what the title's own
     /// copy of the value (read from memory) is raised to.
     pub fn completed(&mut self) -> Vec<(usize, u64)> {
-        let values = self
+        let values: Vec<(usize, u64)> = self
             .fences
             .iter()
             .map(|(k, f)| (*k, self.host.backend.completed(f)))
             .collect();
+        for &(key, done) in &values {
+            if self.requested.get(&key).is_some_and(|&(want, _)| done >= want) {
+                self.requested.remove(&key);
+            }
+        }
         // After the values are read: the work they cover is done, so what it wrote is in title
         // memory before the title sees them.
         self.copy_back();
@@ -388,35 +448,27 @@ impl<B: PresentBackend> Title<B> {
             let waits: Vec<ValueWait> = waits.into_iter().map(Into::into).collect();
             self.held.push(queue, Item::Segment(Rc::new(list), waits));
         }
+        // After the lists: what they wrote into objects that placed views of other formats read.
+        if let Some(copies) = self.alias_copy_list() {
+            self.stats.segments += 1;
+            self.held.push(queue, Item::Segment(Rc::new(copies), Vec::new()));
+        }
         self.pump();
     }
 
-    /// `ID3D12CommandQueue::Signal`: behind work the queue still holds, else on the GPU at once
-    /// (after the work already submitted to its queue).
+    /// `ID3D12CommandQueue::Signal`: retain the action at its queue's head
+    /// until submission succeeds, including when no earlier work is held.
     pub fn signal_queue(&mut self, queue: usize, fence: usize, initial: u64, value: u64) {
         let r = self.requested.entry(fence).or_insert((0, std::time::Instant::now()));
         if value > r.0 {
             *r = (value, std::time::Instant::now());
         }
-        if self.held.holds_work(queue) {
-            let n = self.next_action;
-            self.next_action += 1;
-            let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial)) else { return };
-            self.actions.insert(n, QueuedAction::Signal(q, f, value));
-            self.held.push(queue, Item::Signal(n, 0));
-        } else {
-            self.signal_gpu(queue, fence, initial, value);
-        }
+        let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial)) else { return };
+        let n = self.next_action;
+        self.next_action += 1;
+        self.actions.insert(n, QueuedAction::Signal(q, f, value));
+        self.held.push(queue, Item::Signal(n, 0));
         self.pump();
-    }
-
-    fn signal_gpu(&mut self, queue: usize, fence: usize, initial: u64, value: u64) {
-        let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial)) else {
-            return;
-        };
-        if let Err(e) = self.host.execute(&q, &[], &[], &[(&*f, value)]) {
-            tracing::warn!(error = %e, "a fence signal was not queued");
-        }
     }
 
     /// Queue waits remain on the CPU until completion, including committed producers.
@@ -431,8 +483,17 @@ impl<B: PresentBackend> Title<B> {
         self.pump();
     }
 
+    /// A conservative O(1) summary published before releasing TITLE. GPU completion can
+    /// discharge these obligations but cannot create one; every producer holds TITLE.
+    #[cfg(target_os = "macos")]
+    pub(super) fn timer_needed(&self) -> bool {
+        !self.held.is_empty() || !self.requested.is_empty() || self.back.has_pending()
+    }
+
     /// Runs the heads of held queues that may run, until none can.
     pub fn pump(&mut self) {
+        #[cfg(target_os = "macos")]
+        let _pump = Timer::counted(Metric::Pump, Metric::Pumps);
         if self.held.is_empty() {
             return;
         }
@@ -471,7 +532,8 @@ impl<B: PresentBackend> Title<B> {
             match actions.get(&n) {
                 Some(QueuedAction::Signal(q, f, value)) => {
                     if let Err(e) = host.execute(q, &[], &[], &[(&**f, *value)]) {
-                        tracing::warn!(error = %e, "a held fence signal was not queued");
+                        tracing::warn!(error = %e, "a held fence signal was not queued; retaining it for retry");
+                        return false;
                     }
                 }
                 Some(QueuedAction::Present(queue, surface, planes)) => {
@@ -514,7 +576,7 @@ impl<B: PresentBackend> Title<B> {
                 let f = self.fences.get(k)?;
                 let done = self.host.backend.completed(f);
                 (done < want && since.elapsed() >= limit)
-                    .then(|| format!("fence {k:#x}: signal of {want} queued {:.1?} ago, GPU at {done}", since.elapsed()))
+                    .then(|| format!("fence {k:#x}: signal of {want} requested {:.1?} ago, GPU at {done}", since.elapsed()))
             })
             .collect();
         let memory = self.host.memory();
@@ -670,5 +732,35 @@ mod scheduling_tests {
             title.pump();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod timer_cpu_tests {
+    use super::*;
+    use crate::native::host::mirror_tests::Recording;
+    use victory_backend::backend::ComputeBackend;
+
+    #[test]
+    fn timer_obligations_survive_holds_and_unsignalled_fences() {
+        let mut t = Title::new(Recording::default(), Arc::new(PoolTable::default()));
+        assert!(!t.timer_needed());
+        t.signal_queue(1, 2, 0, 3);
+        assert!(t.timer_needed(), "submission is not completion");
+        t.completed();
+        assert!(t.timer_needed());
+        let f = t.fence(2, 0).unwrap();
+        t.host.backend.signal(&f, 3);
+        assert_eq!(t.completed(), vec![(2, 3)]);
+        assert!(!t.timer_needed());
+        t.wait_queue(1, 2, 0, 4);
+        assert!(t.timer_needed(), "memory/fence waits must keep polling");
+        t.signal_cpu(2, 0, 4);
+        t.completed();
+        assert!(!t.timer_needed());
+        t.signal_queue(1, 3, 0, 1);
+        assert!(t.timer_needed());
+        t.forget_fence(3);
+        assert!(!t.timer_needed());
     }
 }

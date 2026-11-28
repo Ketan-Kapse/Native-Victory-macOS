@@ -193,7 +193,7 @@ fn program() -> HostShader {
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
-        mesh_stride: 0,
+        mesh_stride: 0, mesh_fit: Default::default(),
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
@@ -201,6 +201,7 @@ fn program() -> HostShader {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
         view_marks: false,
     })
     .expect("lower");
@@ -431,7 +432,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
-        mesh_stride: 0,
+        mesh_stride: 0, mesh_fit: Default::default(),
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
@@ -439,6 +440,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
         view_marks: false,
     })
     .expect("lower");
@@ -582,7 +584,7 @@ fn writes_through_views_mark_their_pages() {
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
-        mesh_stride: 0,
+        mesh_stride: 0, mesh_fit: Default::default(),
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
@@ -590,6 +592,7 @@ fn writes_through_views_mark_their_pages() {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
         view_marks: true,
     })
     .expect("lower");
@@ -707,7 +710,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             inputs: Vec::new(),
             outputs: Vec::new(),
             prims: Vec::new(),
-            mesh_stride: 0,
+            mesh_stride: 0, mesh_fit: Default::default(),
             view_marks: true,
             atomic_locks: false,
             bias_as_gradients: false,
@@ -716,6 +719,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             zero_copy_memory: false,
             rect_list: false,
             copy_params: [0; 32],
+            bvh_no_hit: false,
         })
         .expect("lower")
     };
